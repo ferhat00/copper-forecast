@@ -31,8 +31,9 @@ def compute_metrics(
     y_true: pd.Series | np.ndarray,
     y_pred: np.ndarray,
     name: str = "",
+    horizon: int = 22,
 ) -> dict[str, float]:
-    """Compute RMSE, MAE, MAPE and directional accuracy.
+    """Compute RMSE, MAE, MAPE, directional accuracy, and signal Sharpe.
 
     Parameters
     ----------
@@ -42,10 +43,13 @@ def compute_metrics(
         Predicted values (same length as ``y_true``).
     name:
         Optional label for logging.
+    horizon:
+        Forecast horizon in trading days (used for annualising Sharpe).
 
     Returns
     -------
-    dict with keys: rmse, mae, mape, directional_accuracy
+    dict with keys: rmse, mae, mape, directional_accuracy, signal_sharpe,
+    information_ratio
     """
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
@@ -62,10 +66,30 @@ def compute_metrics(
 
     da = directional_accuracy(y_true, y_pred)
 
-    metrics = {"rmse": rmse, "mae": mae, "mape": mape, "directional_accuracy": da}
+    # Signal Sharpe: annualised Sharpe of a long/short strategy based on
+    # predicted direction.  signal_returns[i] = sign(pred[i]) * actual[i]
+    signal_returns = np.sign(y_pred) * y_true
+    annualise = np.sqrt(252 / max(horizon, 1))
+    if len(signal_returns) > 1 and np.std(signal_returns) > 0:
+        signal_sharpe = float(np.mean(signal_returns) / np.std(signal_returns) * annualise)
+    else:
+        signal_sharpe = 0.0
+
+    # Information ratio (vs naive/zero benchmark — identical to signal Sharpe
+    # because the naive forecast is 0 and the excess return equals the signal return)
+    information_ratio = signal_sharpe
+
+    metrics = {
+        "rmse": rmse,
+        "mae": mae,
+        "mape": mape,
+        "directional_accuracy": da,
+        "signal_sharpe": signal_sharpe,
+        "information_ratio": information_ratio,
+    }
     if name:
-        logger.info("[%s] RMSE=%.4f  MAE=%.4f  MAPE=%.2f%%  DA=%.2f%%",
-                    name, rmse, mae, mape, da * 100)
+        logger.info("[%s] RMSE=%.4f  MAE=%.4f  MAPE=%.2f%%  DA=%.2f%%  Sharpe=%.2f",
+                    name, rmse, mae, mape, da * 100, signal_sharpe)
     return metrics
 
 
@@ -165,6 +189,7 @@ def compare_models(
     y: pd.Series,
     initial_train_size: int = 504,
     step_size: int = 22,
+    horizon: int = 22,
 ) -> pd.DataFrame:
     """Run several models through walk-forward CV and tabulate metrics.
 
@@ -189,7 +214,7 @@ def compare_models(
         logger.info("Evaluating model: %s", m.name)
         cv = walk_forward_cv(m, X, y, initial_train_size=initial_train_size,
                              step_size=step_size)
-        metrics = compute_metrics(cv["y_true"], cv["y_pred"], name=m.name)
+        metrics = compute_metrics(cv["y_true"], cv["y_pred"], name=m.name, horizon=horizon)
         metrics["model"] = m.name
         rows.append(metrics)
         cv_results[m.name] = cv
@@ -203,6 +228,7 @@ def out_of_sample_backtest(
     X: pd.DataFrame,
     y: pd.Series,
     holdout_size: int = 252,
+    horizon: int = 22,
 ) -> tuple[pd.DataFrame, dict[str, float]]:
     """Train on all-but-last ``holdout_size`` rows; test on the remainder.
 
@@ -231,5 +257,6 @@ def out_of_sample_backtest(
         {"y_true": y.iloc[split:].values, "y_pred": preds},
         index=y.iloc[split:].index,
     )
-    metrics = compute_metrics(oos["y_true"], oos["y_pred"], name=f"{model.name} OOS")
+    metrics = compute_metrics(oos["y_true"], oos["y_pred"], name=f"{model.name} OOS",
+                              horizon=horizon)
     return oos, metrics

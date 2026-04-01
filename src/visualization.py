@@ -378,3 +378,85 @@ def plot_dashboard(
         title_text="Copper Forecasting Dashboard",
     )
     return fig
+
+
+# ---------------------------------------------------------------------------
+# 9. Regime overlay
+# ---------------------------------------------------------------------------
+
+
+def plot_regime_overlay(
+    price_series: pd.Series,
+    regime_labels: pd.Series,
+    title: str = "Copper Price with Detected Market Regimes",
+) -> go.Figure:
+    """Overlay HMM regime states on the copper price chart with coloured backgrounds.
+
+    Parameters
+    ----------
+    price_series:
+        Copper price ($/t) indexed by date.
+    regime_labels:
+        Integer regime labels aligned with the price index (e.g. 0, 1, 2).
+    """
+    regime_colours = {
+        0: "rgba(255, 77, 77, 0.15)",   # bear — red tint
+        1: "rgba(255, 193, 7, 0.15)",    # sideways — amber tint
+        2: "rgba(76, 175, 80, 0.15)",    # bull — green tint
+    }
+    regime_names = {0: "Bear", 1: "Sideways", 2: "Bull"}
+
+    fig = go.Figure()
+
+    # Price line
+    fig.add_trace(go.Scatter(
+        x=price_series.index,
+        y=price_series.values,
+        name="Copper Price",
+        line=dict(color=PALETTE["copper"], width=1.5),
+    ))
+
+    # Regime background shading
+    valid = regime_labels.dropna()
+    if len(valid) > 0:
+        # Find contiguous blocks of the same regime
+        prev_regime = None
+        block_start = None
+        for dt, regime in valid.items():
+            regime = int(regime)
+            if regime != prev_regime:
+                if prev_regime is not None and block_start is not None:
+                    fig.add_vrect(
+                        x0=block_start, x1=dt,
+                        fillcolor=regime_colours.get(prev_regime, "rgba(128,128,128,0.1)"),
+                        layer="below", line_width=0,
+                    )
+                block_start = dt
+                prev_regime = regime
+        # Close the last block
+        if prev_regime is not None and block_start is not None:
+            fig.add_vrect(
+                x0=block_start, x1=valid.index[-1],
+                fillcolor=regime_colours.get(prev_regime, "rgba(128,128,128,0.1)"),
+                layer="below", line_width=0,
+            )
+
+    # Add invisible traces for the legend
+    for r, name in regime_names.items():
+        colour = regime_colours.get(r, "rgba(128,128,128,0.3)")
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None],
+            mode="markers",
+            marker=dict(size=10, color=colour.replace("0.15", "0.6")),
+            name=name,
+        ))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="Date",
+        yaxis_title="Price ($/t)",
+        template="plotly_white",
+        hovermode="x unified",
+        height=500,
+    )
+    return fig

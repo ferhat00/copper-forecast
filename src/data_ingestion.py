@@ -54,7 +54,7 @@ FRED_SERIES: dict[str, str] = {
 
 def fetch_yfinance(
     tickers: Optional[dict[str, str]] = None,
-    start: str = "2015-01-01",
+    start: str = "2010-01-01",
     end: Optional[str] = None,
 ) -> pd.DataFrame:
     """Download adjusted close prices from yfinance.
@@ -107,7 +107,7 @@ def fetch_yfinance(
 
 def fetch_fred(
     series: Optional[dict[str, str]] = None,
-    start: str = "2015-01-01",
+    start: str = "2010-01-01",
     end: Optional[str] = None,
     fred_api_key: Optional[str] = None,
 ) -> pd.DataFrame:
@@ -179,17 +179,20 @@ def fetch_fred(
 
 
 def load_data(
-    start: str = "2015-01-01",
+    start: str = "2010-01-01",
     end: Optional[str] = None,
     fred_api_key: Optional[str] = None,
+    include_cot: bool = True,
+    nasdaq_api_key: Optional[str] = None,
 ) -> pd.DataFrame:
     """Fetch all data sources and return a single aligned DataFrame.
 
     Steps:
     1. Download yfinance price data.
     2. Download FRED macro data.
-    3. Outer-join on date index; forward-fill up to 5 days; drop remaining NaN rows.
-    4. Ensure index is sorted ascending.
+    3. Optionally download COT positioning data.
+    4. Outer-join on date index; forward-fill up to 5 days; drop remaining NaN rows.
+    5. Ensure index is sorted ascending.
 
     Parameters
     ----------
@@ -199,6 +202,10 @@ def load_data(
         Training window end date.  Defaults to today.
     fred_api_key:
         Optional FRED API key.
+    include_cot:
+        If True, attempt to download COT positioning data.
+    nasdaq_api_key:
+        Optional Nasdaq Data Link API key for COT data.
 
     Returns
     -------
@@ -212,6 +219,18 @@ def load_data(
     fred_daily = fred_df.reindex(yf_df.index, method="ffill")
 
     df = pd.concat([yf_df, fred_daily], axis=1)
+
+    # COT positioning data
+    if include_cot:
+        try:
+            from src.cot_data import align_cot_to_daily, fetch_cot_data
+            cot = fetch_cot_data(start=start, end=end, api_key=nasdaq_api_key)
+            cot_daily = align_cot_to_daily(cot, df.index)
+            df = pd.concat([df, cot_daily], axis=1)
+            logger.info("COT data integrated: %d columns added", cot_daily.shape[1])
+        except Exception as exc:
+            logger.warning("COT data unavailable: %s", exc)
+
     df = df.sort_index()
     df = df.ffill(limit=5)
 

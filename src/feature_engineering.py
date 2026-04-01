@@ -52,11 +52,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DEFAULT_LAGS = [1, 5, 22]
-DEFAULT_HORIZONS = [5, 22, 66]   # 1-week, 1-month, 3-month ahead
+DEFAULT_HORIZONS = [1, 5, 22, 66]   # 1-day, 1-week, 1-month, 3-month ahead
 
 # Chinese New Year approximate dates (week of the holiday)
 # Extend as needed; the flag covers ±3 trading days around the date
 CNY_DATES = [
+    "2010-02-14", "2011-02-03", "2012-01-23", "2013-02-10", "2014-01-31",
     "2015-02-19", "2016-02-08", "2017-01-28", "2018-02-16",
     "2019-02-05", "2020-01-25", "2021-02-12", "2022-02-01",
     "2023-01-22", "2024-02-10", "2025-01-29", "2026-02-17",
@@ -94,6 +95,53 @@ def _bollinger_width(series: pd.Series, window: int = 20, n_std: float = 2.0) ->
     upper = mid + n_std * std
     lower = mid - n_std * std
     return (upper - lower) / mid.replace(0, np.nan)
+
+
+def _quarter_end_flag(index: pd.DatetimeIndex) -> pd.Series:
+    """Flag last 5 business days of each quarter."""
+    flag = pd.Series(0.0, index=index)
+    # Find quarter-end business days
+    for year in index.year.unique():
+        for month in [3, 6, 9, 12]:
+            qe = pd.Timestamp(year=year, month=month, day=1) + pd.offsets.BMonthEnd(0)
+            for delta in range(5):
+                ts = qe - pd.offsets.BDay(delta)
+                if ts in flag.index:
+                    flag[ts] = 1.0
+    return flag
+
+
+def _us_holiday_flag(index: pd.DatetimeIndex) -> pd.Series:
+    """Flag trading days adjacent to US federal holidays (day before + after)."""
+    from pandas.tseries.holiday import USFederalHolidayCalendar
+
+    flag = pd.Series(0.0, index=index)
+    cal = USFederalHolidayCalendar()
+    holidays = cal.holidays(start=index.min(), end=index.max())
+    for h in holidays:
+        for delta in [-1, 0, 1]:
+            ts = h + pd.offsets.BDay(delta)
+            if ts in flag.index:
+                flag[ts] = 1.0
+    return flag
+
+
+def _options_expiry_flag(index: pd.DatetimeIndex) -> pd.Series:
+    """Flag 3rd Friday of each month (Comex options expiry) and the day before."""
+    flag = pd.Series(0.0, index=index)
+    for year in index.year.unique():
+        for month in range(1, 13):
+            # Find 3rd Friday: first day of month, advance to Friday, then +2 weeks
+            first = pd.Timestamp(year=year, month=month, day=1)
+            # Days until Friday (weekday=4)
+            days_to_friday = (4 - first.weekday()) % 7
+            first_friday = first + pd.Timedelta(days=days_to_friday)
+            third_friday = first_friday + pd.Timedelta(weeks=2)
+            for delta in [0, -1]:
+                ts = third_friday + pd.offsets.BDay(delta)
+                if ts in flag.index:
+                    flag[ts] = 1.0
+    return flag
 
 
 def _cny_flag(index: pd.DatetimeIndex) -> pd.Series:
@@ -210,6 +258,9 @@ def build_features(
     series["month_sin"] = pd.Series(np.sin(2 * np.pi * month / 12), index=idx)
     series["month_cos"] = pd.Series(np.cos(2 * np.pi * month / 12), index=idx)
     series["cny_flag"] = _cny_flag(idx)
+    series["quarter_end_flag"] = _quarter_end_flag(idx)
+    series["us_holiday_flag"] = _us_holiday_flag(idx)
+    series["options_expiry_flag"] = _options_expiry_flag(idx)
 
     # Build base DataFrame in one concat to avoid fragmentation
     base_df = pd.concat(series, axis=1)

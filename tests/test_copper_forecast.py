@@ -222,7 +222,7 @@ class TestEvaluation:
         y = np.ones(10)
         p = np.zeros(10)
         m = compute_metrics(y, p)
-        for k in ["rmse", "mae", "mape", "directional_accuracy"]:
+        for k in ["rmse", "mae", "mape", "directional_accuracy", "signal_sharpe", "information_ratio"]:
             assert k in m
 
     def test_directional_accuracy_range(self):
@@ -317,3 +317,57 @@ class TestScenarioAnalysis:
         df = engine.report()
         assert isinstance(df, pd.DataFrame)
         assert "delta_pct" in df.columns
+
+
+# ---------------------------------------------------------------------------
+# New feature tests
+# ---------------------------------------------------------------------------
+
+
+class TestNewFeatures:
+    def test_1d_horizon_target(self):
+        df = _make_price_df()
+        feats = build_features(df, horizons=[1, 5, 22, 66])
+        assert "target_ret_1d" in feats.columns
+        assert "target_price_1d" in feats.columns
+
+    def test_calendar_quarter_end(self):
+        df = _make_price_df()
+        feats = build_features(df)
+        assert "quarter_end_flag" in feats.columns
+        # Flag should be binary
+        vals = feats["quarter_end_flag"].dropna().unique()
+        assert set(vals).issubset({0.0, 1.0})
+
+    def test_calendar_us_holiday(self):
+        df = _make_price_df()
+        feats = build_features(df)
+        assert "us_holiday_flag" in feats.columns
+
+    def test_calendar_options_expiry(self):
+        df = _make_price_df()
+        feats = build_features(df)
+        assert "options_expiry_flag" in feats.columns
+
+    def test_extended_cny_dates(self):
+        """CNY flag should work for dates in 2010-2014 range."""
+        rng = np.random.default_rng(42)
+        idx = pd.date_range("2010-01-02", periods=500, freq="B")
+        price = 8000 + rng.standard_normal(500).cumsum() * 50
+        df = pd.DataFrame({"copper_price": price}, index=idx)
+        feats = build_features(df, horizons=[5, 22])
+        assert "cny_flag" in feats.columns
+        # Should have some CNY flags set
+        assert feats["cny_flag"].sum() > 0
+
+    def test_signal_sharpe_positive_for_perfect_predictions(self):
+        y = np.array([0.01, -0.01, 0.02, -0.02, 0.01])
+        p = y.copy()  # perfect predictions
+        m = compute_metrics(y, p, horizon=22)
+        assert m["signal_sharpe"] > 0
+
+    def test_signal_sharpe_negative_for_inverted_predictions(self):
+        y = np.array([0.01, -0.01, 0.02, -0.02, 0.01])
+        p = -y  # inverted predictions
+        m = compute_metrics(y, p, horizon=22)
+        assert m["signal_sharpe"] < 0

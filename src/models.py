@@ -40,6 +40,15 @@ class BaseForecaster:
     def predict(self, X: pd.DataFrame) -> np.ndarray:
         raise NotImplementedError
 
+    def predict_interval(self, X: pd.DataFrame, alpha: float = 0.80) -> pd.DataFrame:
+        """Return DataFrame with columns: lower, median, upper.
+
+        Override in subclasses that support prediction intervals.
+        """
+        raise NotImplementedError(
+            f"{self.name} does not support prediction intervals"
+        )
+
     @property
     def name(self) -> str:
         return self.__class__.__name__
