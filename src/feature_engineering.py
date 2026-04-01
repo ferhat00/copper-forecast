@@ -78,8 +78,7 @@ def _wilder_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return 100 - 100 / (1 + rs)
 
 
-def _macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9
-          ) -> tuple[pd.Series, pd.Series]:
+def _macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> tuple[pd.Series, pd.Series]:
     """Return (MACD line, signal line)."""
     ema_fast = series.ewm(span=fast, adjust=False).mean()
     ema_slow = series.ewm(span=slow, adjust=False).mean()
@@ -88,8 +87,7 @@ def _macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9
     return macd_line, signal_line
 
 
-def _bollinger_width(series: pd.Series, window: int = 20, n_std: float = 2.0
-                     ) -> pd.Series:
+def _bollinger_width(series: pd.Series, window: int = 20, n_std: float = 2.0) -> pd.Series:
     """Bollinger Band width = (upper - lower) / mid."""
     mid = series.rolling(window).mean()
     std = series.rolling(window).std()

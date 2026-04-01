@@ -165,7 +165,7 @@ def fetch_fred(
             "Generating synthetic placeholder series."
         )
         idx = pd.date_range(start, end, freq="D")
-        rng = pd.RNG = __import__("numpy").random.default_rng(42)
+        rng = __import__("numpy").random.default_rng(42)
         for col in series:
             frames[col] = pd.Series(
                 rng.standard_normal(len(idx)).cumsum() + 100,
