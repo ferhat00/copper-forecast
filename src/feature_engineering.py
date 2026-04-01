@@ -1,0 +1,287 @@
+"""
+feature_engineering.py
+=======================
+Builds the modelling feature matrix from the raw price/macro DataFrame.
+
+Features produced
+-----------------
+Price-derived
+    copper_ret_{n}d        : n-day log return of copper price
+    copper_vol_{n}d        : rolling n-day realised volatility (annualised)
+    copper_zscore_200d     : z-score of copper price relative to 200-day MA
+    rsi_14                 : 14-day Wilder RSI
+    macd                   : MACD line (12-26 EMA difference)
+    macd_signal            : 9-day EMA of MACD
+    bb_width               : Bollinger Band width (2σ / mid)
+
+Cross-asset
+    gold_copper_ratio      : Gold/copper ratio (economic health signal)
+    oil_copper_ratio       : Oil/copper ratio
+    alu_copper_spread_pct  : % spread between aluminium and copper (subst. signal)
+    dxy_ret_22d            : 1-month DXY return
+
+Fundamental/macro
+    indpro_yoy             : Year-on-year growth in industrial production
+    real_yield_change_22d  : 22-day change in real 10Y yield
+    infl_be_level          : Inflation breakeven level
+
+Calendar
+    month_sin / month_cos  : Cyclical encoding of calendar month
+    cny_flag               : Binary flag for Chinese New Year trading week
+
+Lagged features
+    {feature}_lag_{n}      : 1, 5, 22-day lags of all numeric features
+
+Target
+    target_ret_{h}d        : h-day forward log return (forecast horizon)
+    target_price_{h}d      : h-day forward copper price
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+DEFAULT_LAGS = [1, 5, 22]
+DEFAULT_HORIZONS = [5, 22, 66]   # 1-week, 1-month, 3-month ahead
+
+# Chinese New Year approximate dates (week of the holiday)
+# Extend as needed; the flag covers ±3 trading days around the date
+CNY_DATES = [
+    "2015-02-19", "2016-02-08", "2017-01-28", "2018-02-16",
+    "2019-02-05", "2020-01-25", "2021-02-12", "2022-02-01",
+    "2023-01-22", "2024-02-10", "2025-01-29", "2026-02-17",
+]
+
+# ---------------------------------------------------------------------------
+# Technical helpers
+# ---------------------------------------------------------------------------
+
+
+def _wilder_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """Compute Wilder's RSI."""
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - 100 / (1 + rs)
+
+
+def _macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> tuple[pd.Series, pd.Series]:
+    """Return (MACD line, signal line)."""
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    return macd_line, signal_line
+
+
+def _bollinger_width(series: pd.Series, window: int = 20, n_std: float = 2.0) -> pd.Series:
+    """Bollinger Band width = (upper - lower) / mid."""
+    mid = series.rolling(window).mean()
+    std = series.rolling(window).std()
+    upper = mid + n_std * std
+    lower = mid - n_std * std
+    return (upper - lower) / mid.replace(0, np.nan)
+
+
+def _cny_flag(index: pd.DatetimeIndex) -> pd.Series:
+    """Binary flag: 1 during the ±3 trading-day window around CNY."""
+    flag = pd.Series(0, index=index, dtype=float)
+    for d in CNY_DATES:
+        centre = pd.Timestamp(d)
+        for delta in range(-3, 4):
+            ts = centre + pd.offsets.BDay(delta)
+            if ts in flag.index:
+                flag[ts] = 1.0
+    return flag
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
+
+
+def build_features(
+    df: pd.DataFrame,
+    lags: Optional[list[int]] = None,
+    horizons: Optional[list[int]] = None,
+    primary_horizon: int = 22,
+) -> pd.DataFrame:
+    """Construct the full feature matrix from the raw DataFrame.
+
+    Parameters
+    ----------
+    df:
+        Output of :func:`src.data_ingestion.load_data`.
+    lags:
+        List of look-back periods (days) to use for lagged features.
+    horizons:
+        Forward horizons (days) for which to compute target variables.
+    primary_horizon:
+        The main forecast horizon; its target columns are not lagged.
+
+    Returns
+    -------
+    pd.DataFrame
+        Feature matrix with targets appended.  Rows with NaN features
+        are dropped only after lag construction.
+    """
+    if lags is None:
+        lags = DEFAULT_LAGS
+    if horizons is None:
+        horizons = DEFAULT_HORIZONS
+
+    cp = df["copper_price"]
+    idx = df.index
+    series: dict[str, pd.Series] = {}
+
+    # -----------------------------------------------------------------------
+    # Price-derived features
+    # -----------------------------------------------------------------------
+    for n in [1, 5, 22]:
+        series[f"copper_ret_{n}d"] = np.log(cp / cp.shift(n))
+
+    for n in [5, 22, 66]:
+        series[f"copper_vol_{n}d"] = (
+            np.log(cp / cp.shift(1)).rolling(n).std() * np.sqrt(252)
+        )
+
+    ma200 = cp.rolling(200).mean()
+    std200 = cp.rolling(200).std()
+    series["copper_zscore_200d"] = (cp - ma200) / std200.replace(0, np.nan)
+
+    series["rsi_14"] = _wilder_rsi(cp)
+    macd_line, signal_line = _macd(cp)
+    series["macd"] = macd_line
+    series["macd_signal"] = signal_line
+    series["bb_width"] = _bollinger_width(cp)
+
+    # -----------------------------------------------------------------------
+    # Cross-asset features
+    # -----------------------------------------------------------------------
+    if "gold" in df.columns:
+        series["gold_copper_ratio"] = df["gold"] / cp.replace(0, np.nan)
+
+    if "oil" in df.columns:
+        series["oil_copper_ratio"] = df["oil"] / cp.replace(0, np.nan)
+
+    if "aluminium" in df.columns:
+        series["alu_copper_spread_pct"] = (df["aluminium"] - cp) / cp.replace(0, np.nan)
+
+    if "dxy" in df.columns:
+        series["dxy_level"] = df["dxy"]
+        series["dxy_ret_22d"] = np.log(df["dxy"] / df["dxy"].shift(22))
+
+    if "cny_usd" in df.columns:
+        series["cny_usd_level"] = df["cny_usd"]
+
+    if "sp500" in df.columns:
+        series["sp500_ret_22d"] = np.log(df["sp500"] / df["sp500"].shift(22))
+
+    # -----------------------------------------------------------------------
+    # Macro / fundamental features
+    # -----------------------------------------------------------------------
+    if "indpro" in df.columns:
+        series["indpro_yoy"] = df["indpro"].pct_change(252)
+
+    if "real_yield_10y" in df.columns:
+        series["real_yield_level"] = df["real_yield_10y"]
+        series["real_yield_change_22d"] = df["real_yield_10y"].diff(22)
+
+    if "inflation_breakeven" in df.columns:
+        series["infl_be_level"] = df["inflation_breakeven"]
+
+    # -----------------------------------------------------------------------
+    # Calendar features
+    # -----------------------------------------------------------------------
+    month = idx.month
+    series["month_sin"] = pd.Series(np.sin(2 * np.pi * month / 12), index=idx)
+    series["month_cos"] = pd.Series(np.cos(2 * np.pi * month / 12), index=idx)
+    series["cny_flag"] = _cny_flag(idx)
+
+    # Build base DataFrame in one concat to avoid fragmentation
+    base_df = pd.concat(series, axis=1)
+    base_df.columns = list(series.keys())
+
+    # -----------------------------------------------------------------------
+    # Lagged features — build all at once via concat
+    # -----------------------------------------------------------------------
+    lag_frames: list[pd.DataFrame] = [base_df]
+    base_cols = list(base_df.columns)
+    for lag in lags:
+        shifted = base_df[base_cols].shift(lag)
+        shifted.columns = [f"{c}_lag_{lag}" for c in base_cols]
+        lag_frames.append(shifted)
+
+    # -----------------------------------------------------------------------
+    # Target variables (forward returns / prices) — built via concat
+    # -----------------------------------------------------------------------
+    target_series: dict[str, pd.Series] = {}
+    for h in horizons:
+        target_series[f"target_ret_{h}d"] = np.log(cp.shift(-h) / cp)
+        target_series[f"target_price_{h}d"] = cp.shift(-h)
+    target_series["copper_price"] = cp
+
+    target_df = pd.concat(target_series, axis=1)
+    target_df.columns = list(target_series.keys())
+
+    lag_frames.append(target_df)
+    feats = pd.concat(lag_frames, axis=1)
+    return feats
+
+
+def split_features_targets(
+    feats: pd.DataFrame,
+    horizon: int = 22,
+    drop_nan: bool = True,
+) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
+    """Separate features, target return series, and target price series.
+
+    Parameters
+    ----------
+    feats:
+        Output of :func:`build_features`.
+    horizon:
+        Forecast horizon to use as the target.
+    drop_nan:
+        If True, drop rows where any feature or target is NaN.
+
+    Returns
+    -------
+    X : pd.DataFrame
+        Feature matrix (excludes target columns and raw price).
+    y_ret : pd.Series
+        Forward log-return target.
+    y_price : pd.Series
+        Forward price target.
+    """
+    target_ret_col = f"target_ret_{horizon}d"
+    target_price_col = f"target_price_{horizon}d"
+
+    # Exclude all target columns and raw copper_price from features
+    target_cols = [c for c in feats.columns if c.startswith("target_")] + ["copper_price"]
+    feature_cols = [c for c in feats.columns if c not in target_cols]
+
+    X = feats[feature_cols]
+    y_ret = feats[target_ret_col]
+    y_price = feats[target_price_col]
+
+    if drop_nan:
+        mask = X.notna().all(axis=1) & y_ret.notna() & y_price.notna()
+        X = X[mask]
+        y_ret = y_ret[mask]
+        y_price = y_price[mask]
+
+    return X, y_ret, y_price
