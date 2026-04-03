@@ -18,11 +18,12 @@ Cross-asset
     gold_copper_ratio      : Gold/copper ratio (economic health signal)
     oil_copper_ratio       : Oil/copper ratio
     alu_copper_spread_pct  : % spread between aluminium and copper (subst. signal)
-    dxy_ret_22d            : 1-month DXY return
+    dxy_ret_{n}d           : n-day DXY return (n = 1, 5, 22)
+    sp500_ret_{n}d         : n-day S&P 500 return (n = 1, 5, 22)
 
 Fundamental/macro
     indpro_yoy             : Year-on-year growth in industrial production
-    real_yield_change_22d  : 22-day change in real 10Y yield
+    real_yield_change_{n}d : n-day change in real 10Y yield (n = 1, 5, 22)
     infl_be_level          : Inflation breakeven level
 
 Calendar
@@ -230,13 +231,15 @@ def build_features(
 
     if "dxy" in df.columns:
         series["dxy_level"] = df["dxy"]
-        series["dxy_ret_22d"] = np.log(df["dxy"] / df["dxy"].shift(22))
+        for n in [1, 5, 22]:
+            series[f"dxy_ret_{n}d"] = np.log(df["dxy"] / df["dxy"].shift(n))
 
     if "cny_usd" in df.columns:
         series["cny_usd_level"] = df["cny_usd"]
 
     if "sp500" in df.columns:
-        series["sp500_ret_22d"] = np.log(df["sp500"] / df["sp500"].shift(22))
+        for n in [1, 5, 22]:
+            series[f"sp500_ret_{n}d"] = np.log(df["sp500"] / df["sp500"].shift(n))
 
     # -----------------------------------------------------------------------
     # Macro / fundamental features
@@ -246,7 +249,8 @@ def build_features(
 
     if "real_yield_10y" in df.columns:
         series["real_yield_level"] = df["real_yield_10y"]
-        series["real_yield_change_22d"] = df["real_yield_10y"].diff(22)
+        for n in [1, 5, 22]:
+            series[f"real_yield_change_{n}d"] = df["real_yield_10y"].diff(n)
 
     if "inflation_breakeven" in df.columns:
         series["infl_be_level"] = df["inflation_breakeven"]

@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -m pytest tests/ -v --tb=short)"
+      "Bash(python -m pytest tests/ -v --tb=short)",
+      "Bash(python -c \"import json; nb=json.load\\(open\\('copper_forecast.ipynb'\\)\\); print\\(len\\(nb['cells']\\), 'cells'\\)\")",
+      "Bash(python -c \"import json; nb=json.load\\(open\\('c:/Users/Ferhat/Documents/GitHub/copper-forecast/copper_forecast.ipynb', encoding='utf-8'\\)\\); print\\(len\\(nb['cells']\\), 'cells'\\)\")",
+      "Bash(python -c ':*)",
+      "Bash(python make_1d_notebook.py)",
+      "Bash(python3 -c ':*)"
     ]
   }
 }
