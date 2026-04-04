@@ -1,9 +1,9 @@
 eia:
-  api_key: "55wZufZB7ZgMqET3LmZhcQVUzjri2ruBbCy97UBT"
+  api_key: "YOUR_EIA_API_KEY"  # set EIA_API_KEY env var or replace this placeholder
   base_url: "https://api.eia.gov/v2"
 
 fred:
-  api_key: "eaee687cdf5188418e1b90c42a6a7ab5"
+  api_key: "YOUR_FRED_API_KEY"  # set FRED_API_KEY env var or replace this placeholder
 
 data:
   start_date: "2015-01-01"
@@ -32,7 +32,7 @@ data:
     total_elec_gen:       "ELEC.GEN.ALL-US-99.M"   # US total net electricity generation (k MWh)
 
 alpha_vantage:
-  api_key: "VTGT0RZTXKB41YMF"  # https://www.alphavantage.co/support/#api-key
+  api_key: "YOUR_ALPHA_VANTAGE_API_KEY"  # set ALPHA_VANTAGE_API_KEY env var or replace this placeholder
   base_url: "https://www.alphavantage.co/query"
   series:
     av_copper:        "COPPER"           # LME copper price — industrial demand composite
