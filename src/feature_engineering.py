@@ -334,6 +334,9 @@ def split_features_targets(
     y_price = feats[target_price_col]
 
     if drop_nan:
+        # Drop columns that are entirely NaN (e.g. a failed API fetch) so they
+        # don't cause every row to be eliminated by the row-wise all() check.
+        X = X.dropna(axis=1, how="all")
         mask = X.notna().all(axis=1) & y_ret.notna() & y_price.notna()
         X = X[mask]
         y_ret = y_ret[mask]
