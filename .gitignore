@@ -207,3 +207,8 @@ marimo/_lsp/
 __marimo__/
 .pytest_cache/
 outputs/
+*.csv
+*.csv
+*.csv
+*.csv
+*.png
