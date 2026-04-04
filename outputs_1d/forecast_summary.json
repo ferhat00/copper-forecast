@@ -1,0 +1,66 @@
+{
+  "generated_at": "2026-04-04",
+  "current_price": 12264.3,
+  "baseline_forecast": 12274.25,
+  "horizon_days": 1,
+  "best_model": "Prophet",
+  "oos_metrics": {
+    "rmse": 0.024524375967056963,
+    "mae": 0.014182272945914811,
+    "mape": 117.44427690761316,
+    "directional_accuracy": 0.49387755102040815,
+    "signal_sharpe": 1.2465417805134988,
+    "information_ratio": 1.2465417805134988
+  },
+  "scenarios": [
+    {
+      "scenario": "supply_disruption",
+      "base_price": 12274.25,
+      "scenario_price": 12263.98,
+      "delta": -10.27,
+      "delta_pct": -0.08
+    },
+    {
+      "scenario": "bear_strong",
+      "base_price": 12274.25,
+      "scenario_price": 12270.53,
+      "delta": -3.72,
+      "delta_pct": -0.03
+    },
+    {
+      "scenario": "comex_inventory_drop_40pct",
+      "base_price": 12274.25,
+      "scenario_price": 12271.56,
+      "delta": -2.7,
+      "delta_pct": -0.02
+    },
+    {
+      "scenario": "us_tariff_shock",
+      "base_price": 12274.25,
+      "scenario_price": 12273.91,
+      "delta": -0.34,
+      "delta_pct": -0.0
+    },
+    {
+      "scenario": "high_inflation",
+      "base_price": 12274.25,
+      "scenario_price": 12275.28,
+      "delta": 1.03,
+      "delta_pct": 0.01
+    },
+    {
+      "scenario": "china_demand_surge",
+      "base_price": 12274.25,
+      "scenario_price": 12285.63,
+      "delta": 11.38,
+      "delta_pct": 0.09
+    },
+    {
+      "scenario": "bull_strong",
+      "base_price": 12274.25,
+      "scenario_price": 12289.25,
+      "delta": 15.0,
+      "delta_pct": 0.12
+    }
+  ]
+}
