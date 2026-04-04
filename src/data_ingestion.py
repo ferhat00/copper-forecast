@@ -677,18 +677,24 @@ def load_data(
     df = pd.concat([yf_df, fred_daily], axis=1)
 
     # Alpha Vantage: LME / World Bank monthly commodity prices
-    av_df = fetch_alpha_vantage(start=start, end=end, api_key=alpha_vantage_api_key)
-    if not av_df.empty:
-        av_daily = av_df.reindex(df.index, method="ffill")
-        df = pd.concat([df, av_daily], axis=1)
-        logger.info("Alpha Vantage data integrated: %d columns added", av_daily.shape[1])
+    if alpha_vantage_api_key:
+        av_df = fetch_alpha_vantage(start=start, end=end, api_key=alpha_vantage_api_key)
+        if not av_df.empty:
+            av_daily = av_df.reindex(df.index, method="ffill")
+            df = pd.concat([df, av_daily], axis=1)
+            logger.info("Alpha Vantage data integrated: %d columns added", av_daily.shape[1])
+    else:
+        av_df = pd.DataFrame()
 
     # EIA: electricity consumption & energy supply series
-    eia_df = fetch_eia(start=start, end=end, api_key=eia_api_key)
-    if not eia_df.empty:
-        eia_daily = eia_df.reindex(df.index, method="ffill")
-        df = pd.concat([df, eia_daily], axis=1)
-        logger.info("EIA data integrated: %d columns added", eia_daily.shape[1])
+    if eia_api_key:
+        eia_df = fetch_eia(start=start, end=end, api_key=eia_api_key)
+        if not eia_df.empty:
+            eia_daily = eia_df.reindex(df.index, method="ffill")
+            df = pd.concat([df, eia_daily], axis=1)
+            logger.info("EIA data integrated: %d columns added", eia_daily.shape[1])
+    else:
+        eia_df = pd.DataFrame()
 
     # COT positioning data
     if include_cot:
