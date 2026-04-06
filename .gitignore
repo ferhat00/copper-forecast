@@ -208,3 +208,9 @@ __marimo__/
 .pytest_cache/
 outputs/
 *.png
+config.yaml
+config.yaml
+*.csv
+config.yaml
+*.yaml
+.claude/settings.local.json
