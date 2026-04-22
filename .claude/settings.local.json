@@ -8,7 +8,8 @@
       "Bash(python make_1d_notebook.py)",
       "Bash(python3 -c ':*)",
       "Bash(python -c \"from src.data_ingestion import YFINANCE_TICKERS, ALPHA_VANTAGE_COMMODITIES, EIA_COPPER_SERIES, fetch_alpha_vantage, fetch_eia, load_data; print\\('yfinance tickers:', len\\(YFINANCE_TICKERS\\)\\); print\\('AV commodities:', list\\(ALPHA_VANTAGE_COMMODITIES.keys\\(\\)\\)\\); print\\('EIA series:', list\\(EIA_COPPER_SERIES.keys\\(\\)\\)\\); print\\('load_data signature OK'\\)\")",
-      "Bash(grep -rl \"config\" /c/Users/Ferhat/Documents/GitHub/copper-forecast/src/ /c/Users/Ferhat/Documents/GitHub/copper-forecast/*.ipynb /c/Users/Ferhat/Documents/GitHub/copper-forecast/*.py)"
+      "Bash(grep -rl \"config\" /c/Users/Ferhat/Documents/GitHub/copper-forecast/src/ /c/Users/Ferhat/Documents/GitHub/copper-forecast/*.ipynb /c/Users/Ferhat/Documents/GitHub/copper-forecast/*.py)",
+      "Bash(ls config*.yaml)"
     ]
   }
 }

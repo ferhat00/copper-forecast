@@ -214,3 +214,5 @@ config.yaml
 config.yaml
 *.yaml
 .claude/settings.local.json
+config.yaml
+config.yaml
