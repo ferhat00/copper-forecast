@@ -104,7 +104,7 @@ class TestStackingEnsemble:
         X, y, _ = _make_xy(n=800)
         split = len(X) - 20
         m = StackingEnsemble(
-            base_models=[LinearModel(), LinearModel()],
+            base_models=[NaiveModel(), LinearModel()],
             oof_initial_size=200,
             oof_step=22,
         )
@@ -119,7 +119,7 @@ class TestStackingEnsemble:
         X, y, _ = _make_xy(n=800)
         split = len(X) - 20
         m = StackingEnsemble(
-            base_models=[LinearModel(), LinearModel()],
+            base_models=[NaiveModel(), LinearModel()],
             oof_initial_size=200,
             oof_step=22,
         )
