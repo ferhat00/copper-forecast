@@ -181,6 +181,75 @@ YFINANCE_TICKERS: dict[str, str] = {
     "commodity_broad2":    "PDBC",        # Invesco Optimum Yield Diversified Commodity ETF
 }
 
+# ---------------------------------------------------------------------------
+# FRED publication lags
+# ---------------------------------------------------------------------------
+# Maps each FRED series column name → number of *business days* to shift
+# the data forward before forward-filling to daily.  This prevents
+# look-ahead bias: a monthly series released ~30 business days after the
+# reference period must be shifted so models only see it after release.
+#
+# Categories:
+#   Monthly (≈ 30 BD lag) : INDPRO, CPI, TCU, unemployment, housing etc.
+#   Weekly  (≈  5 BD lag) : NFCI, EIA natural-gas/crude stocks.
+#   Daily   (   0 BD lag) : Breakeven yields, credit spreads, TIPS yields.
+FRED_PUBLICATION_LAGS: dict[str, int] = {
+    # Monthly releases — typically published 2–6 weeks after reference month
+    "indpro":              30,
+    "indpro_mfg":          30,
+    "capacity_util":       30,
+    "capacity_util_mfg":   30,
+    "housing_starts":      30,
+    "building_permits":    30,
+    "construction_spend":  35,
+    "res_construction":    35,
+    "mfg_employment":      5,    # released with NFP (~first Friday, ~5 BD lag)
+    "mfg_new_orders":      35,
+    "mfg_unfilled_orders": 35,
+    "durable_goods":       25,
+    "auto_sales":          5,
+    "us_m2":               30,
+    "unemployment":        5,    # released with NFP
+    "nonfarm_payrolls":    5,
+    "labor_force_part":    5,
+    "cpi":                 15,
+    "core_cpi":            15,
+    "ppi_all":             15,
+    "ppi_metals":          15,
+    "core_pce":            30,
+    "retail_sales":        15,
+    "consumer_sentiment":  10,
+    "inventory_sales":     45,
+    "trade_balance":       35,
+    "china_mfg_prod":      45,
+    "copper_lme_monthly":  30,
+    # Weekly releases — typically published ~5 BD after reference week
+    "fin_conditions":      5,    # NFCI
+    "eia_gas_storage":     5,
+    "eia_crude_stocks":    5,
+    "eia_crude_prod":      5,
+    "eia_refinery_util":   5,
+    # EIA monthly electricity series
+    "eia_indl_elec_sales": 45,
+    "eia_comm_elec_sales": 45,
+    "eia_total_elec_sales":45,
+    "eia_total_elec_gen":  45,
+    # Alpha Vantage monthly (LME World Bank)
+    "av_copper":           45,
+    "av_aluminum":         45,
+    "av_zinc":             45,
+    "av_nickel":           45,
+    "av_lead":             45,
+    "av_tin":              45,
+    "av_iron_ore":         45,
+    "av_coal":             45,
+    "av_wti":              45,
+    "av_brent":            45,
+    "av_natural_gas":      45,
+}
+# All other series not listed above are treated as daily (lag = 0).
+
+
 FRED_SERIES: dict[str, str] = {
     # ── US Industrial Activity ────────────────────────────────────────────────
     "indpro":              "INDPRO",          # Industrial Production Index (total)
@@ -671,6 +740,12 @@ def load_data(
     yf_df = fetch_yfinance(start=start, end=end)
     fred_df = fetch_fred(start=start, end=end, fred_api_key=fred_api_key)
 
+    # Apply publication lags before forward-filling so that the model can
+    # only see a series after it would realistically have been released.
+    for col, lag_bd in FRED_PUBLICATION_LAGS.items():
+        if col in fred_df.columns and lag_bd > 0:
+            fred_df[col] = fred_df[col].shift(lag_bd, freq="B")
+
     # Reindex FRED to the yfinance business-day calendar
     fred_daily = fred_df.reindex(yf_df.index, method="ffill")
 
@@ -680,6 +755,9 @@ def load_data(
     if alpha_vantage_api_key:
         av_df = fetch_alpha_vantage(start=start, end=end, api_key=alpha_vantage_api_key)
         if not av_df.empty:
+            for col, lag_bd in FRED_PUBLICATION_LAGS.items():
+                if col in av_df.columns and lag_bd > 0:
+                    av_df[col] = av_df[col].shift(lag_bd, freq="B")
             av_daily = av_df.reindex(df.index, method="ffill")
             df = pd.concat([df, av_daily], axis=1)
             logger.info("Alpha Vantage data integrated: %d columns added", av_daily.shape[1])
@@ -690,6 +768,9 @@ def load_data(
     if eia_api_key:
         eia_df = fetch_eia(start=start, end=end, api_key=eia_api_key)
         if not eia_df.empty:
+            for col, lag_bd in FRED_PUBLICATION_LAGS.items():
+                if col in eia_df.columns and lag_bd > 0:
+                    eia_df[col] = eia_df[col].shift(lag_bd, freq="B")
             eia_daily = eia_df.reindex(df.index, method="ffill")
             df = pd.concat([df, eia_daily], axis=1)
             logger.info("EIA data integrated: %d columns added", eia_daily.shape[1])

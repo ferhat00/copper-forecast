@@ -120,8 +120,9 @@ def walk_forward_cv(
     initial_train_size: int = 504,   # ~2 years of daily data
     step_size: int = 22,             # re-fit monthly
     refit: bool = True,
+    rolling_window: Optional[int] = None,
 ) -> pd.DataFrame:
-    """Expanding-window walk-forward cross-validation.
+    """Walk-forward cross-validation with optional rolling window.
 
     Parameters
     ----------
@@ -137,6 +138,10 @@ def walk_forward_cv(
         Number of new rows added to the training window each fold.
     refit:
         If True, re-fit the model on each expanded training set.
+    rolling_window:
+        If set, use a rolling training window of this many rows instead
+        of expanding from the start.  When None (default), the classic
+        expanding-window scheme is used (backward-compatible).
 
     Returns
     -------
@@ -160,6 +165,11 @@ def walk_forward_cv(
         y_train = y.iloc[:train_end]
         X_test = X.iloc[train_end:test_end]
         y_test = y.iloc[train_end:test_end]
+
+        # Rolling-window slice: only keep the most recent `rolling_window` rows
+        if rolling_window is not None:
+            X_train = X_train.iloc[-rolling_window:]
+            y_train = y_train.iloc[-rolling_window:]
 
         if refit or fold == 0:
             model.fit(X_train, y_train)
@@ -190,6 +200,7 @@ def compare_models(
     initial_train_size: int = 504,
     step_size: int = 22,
     horizon: int = 22,
+    rolling_window: Optional[int] = None,
 ) -> pd.DataFrame:
     """Run several models through walk-forward CV and tabulate metrics.
 
@@ -201,6 +212,8 @@ def compare_models(
         Feature matrix and target series.
     initial_train_size, step_size:
         CV parameters (see :func:`walk_forward_cv`).
+    rolling_window:
+        Passed through to :func:`walk_forward_cv`.  None = expanding window.
 
     Returns
     -------
@@ -213,7 +226,7 @@ def compare_models(
     for m in models:
         logger.info("Evaluating model: %s", m.name)
         cv = walk_forward_cv(m, X, y, initial_train_size=initial_train_size,
-                             step_size=step_size)
+                             step_size=step_size, rolling_window=rolling_window)
         metrics = compute_metrics(cv["y_true"], cv["y_pred"], name=m.name, horizon=horizon)
         metrics["model"] = m.name
         rows.append(metrics)
