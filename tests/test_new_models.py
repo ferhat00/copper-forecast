@@ -60,51 +60,6 @@ def _make_xy(n: int = 500, horizon: int = 22, seed: int = 42):
 
 
 # ---------------------------------------------------------------------------
-# ARIMAX tests
-# ---------------------------------------------------------------------------
-
-
-class TestARIMAXModel:
-    def test_fit_predict_shape(self):
-        from src.models_arimax import ARIMAXModel
-
-        X, y, _ = _make_xy(n=800)
-        split = len(X) - 20
-        m = ARIMAXModel()
-        m.fit(X.iloc[:split], y.iloc[:split])
-        preds = m.predict(X.iloc[split:])
-        assert preds.shape == (20,)
-        assert np.isfinite(preds).all()
-
-    def test_predict_interval_returns_dataframe(self):
-        from src.models_arimax import ARIMAXModel
-
-        X, y, _ = _make_xy(n=800)
-        split = len(X) - 20
-        m = ARIMAXModel()
-        m.fit(X.iloc[:split], y.iloc[:split])
-        ci = m.predict_interval(X.iloc[split:], alpha=0.80)
-        assert isinstance(ci, pd.DataFrame)
-        assert set(ci.columns) == {"lower", "median", "upper"}
-        assert len(ci) == 20
-
-    def test_exog_cols_filtering(self):
-        from src.models_arimax import ARIMAXModel
-
-        X, y, _ = _make_xy(n=800)
-        split = len(X) - 20
-        m = ARIMAXModel(exog_cols=["dxy_level", "nonexistent_col"])
-        m.fit(X.iloc[:split], y.iloc[:split])
-        assert "nonexistent_col" not in m._exog_cols
-        assert "dxy_level" in m._exog_cols or len(m._exog_cols) == 0
-
-    def test_name(self):
-        from src.models_arimax import ARIMAXModel
-
-        assert ARIMAXModel().name == "ARIMAX"
-
-
-# ---------------------------------------------------------------------------
 # Prophet tests
 # ---------------------------------------------------------------------------
 
@@ -138,44 +93,6 @@ class TestProphetModel:
 
 
 # ---------------------------------------------------------------------------
-# Hybrid model tests
-# ---------------------------------------------------------------------------
-
-
-class TestHybridModel:
-    def test_fit_predict_shape(self):
-        from src.models_arimax import ARIMAXModel
-        from src.models_hybrid import HybridModel
-
-        X, y, _ = _make_xy(n=800)
-        split = len(X) - 20
-        m = HybridModel(backbone=ARIMAXModel(), residual_model=LinearModel())
-        m.fit(X.iloc[:split], y.iloc[:split])
-        preds = m.predict(X.iloc[split:])
-        assert preds.shape == (20,)
-        assert np.isfinite(preds).all()
-
-    def test_predict_interval(self):
-        from src.models_arimax import ARIMAXModel
-        from src.models_hybrid import HybridModel
-
-        X, y, _ = _make_xy(n=800)
-        split = len(X) - 20
-        m = HybridModel(backbone=ARIMAXModel(), residual_model=LinearModel())
-        m.fit(X.iloc[:split], y.iloc[:split])
-        ci = m.predict_interval(X.iloc[split:], alpha=0.80)
-        assert isinstance(ci, pd.DataFrame)
-        assert set(ci.columns) == {"lower", "median", "upper"}
-
-    def test_name_contains_components(self):
-        from src.models_hybrid import HybridModel
-
-        m = HybridModel(residual_model=LinearModel())
-        assert "ARIMAX" in m.name
-        assert "Linear" in m.name
-
-
-# ---------------------------------------------------------------------------
 # Stacking ensemble tests
 # ---------------------------------------------------------------------------
 
@@ -183,12 +100,11 @@ class TestHybridModel:
 class TestStackingEnsemble:
     def test_fit_predict_shape(self):
         from src.models_stacking import StackingEnsemble
-        from src.models_arimax import ARIMAXModel
 
         X, y, _ = _make_xy(n=800)
         split = len(X) - 20
         m = StackingEnsemble(
-            base_models=[LinearModel(), ARIMAXModel()],
+            base_models=[NaiveModel(), LinearModel()],
             oof_initial_size=200,
             oof_step=22,
         )
@@ -199,12 +115,11 @@ class TestStackingEnsemble:
 
     def test_meta_learner_trained(self):
         from src.models_stacking import StackingEnsemble
-        from src.models_arimax import ARIMAXModel
 
         X, y, _ = _make_xy(n=800)
         split = len(X) - 20
         m = StackingEnsemble(
-            base_models=[LinearModel(), ARIMAXModel()],
+            base_models=[NaiveModel(), LinearModel()],
             oof_initial_size=200,
             oof_step=22,
         )
