@@ -157,6 +157,82 @@ def _cny_flag(index: pd.DatetimeIndex) -> pd.Series:
     return flag
 
 
+def _har_rv_forecast(
+    log_returns: pd.Series,
+    min_window: int = 252,
+) -> pd.Series:
+    """Compute a HAR-RV (Heterogeneous Autoregressive Realised Variance) 1-step forecast.
+
+    The HAR model (Corsi 2009) decomposes realised variance into daily,
+    weekly, and monthly components and forecasts next-day variance via OLS:
+
+        RV_t+1 = beta_0 + beta_d * RV_d_t + beta_w * RV_w_t + beta_m * RV_m_t + eps
+
+    Parameters
+    ----------
+    log_returns:
+        Daily log-return series (already computed).
+    min_window:
+        Minimum number of rows in the rolling OLS fit (default 252 = 1 year).
+
+    Returns
+    -------
+    pd.Series
+        Next-day realised-variance forecast, annualised and square-rooted
+        to a volatility (same scale as ``copper_vol_{n}d`` features).
+        NaN for rows before the first valid OLS window.
+    """
+    rv_daily = log_returns ** 2  # daily RV = squared return
+
+    rv_weekly = rv_daily.rolling(5).mean()    # 1-week avg RV
+    rv_monthly = rv_daily.rolling(22).mean()  # 1-month avg RV
+
+    forecast = pd.Series(np.nan, index=log_returns.index)
+    n = len(log_returns)
+
+    for i in range(min_window, n):
+        # Regressor matrix for the training window
+        slice_end = i
+        slice_start = max(0, i - min_window)
+
+        rv_d = rv_daily.iloc[slice_start:slice_end].values
+        rv_w = rv_weekly.iloc[slice_start:slice_end].values
+        rv_m = rv_monthly.iloc[slice_start:slice_end].values
+
+        # Align targets: predict next-day RV
+        target = rv_daily.iloc[slice_start + 1: slice_end + 1].values
+
+        # Build design matrix; drop rows with NaN
+        X_mat = np.column_stack([np.ones(len(rv_d)), rv_d, rv_w, rv_m])
+        mask = np.isfinite(X_mat).all(axis=1) & np.isfinite(target)
+        if mask.sum() < 30:
+            continue
+
+        X_fit = X_mat[mask]
+        y_fit = target[mask]
+
+        try:
+            # OLS via least squares
+            coeffs, _, _, _ = np.linalg.lstsq(X_fit, y_fit, rcond=None)
+        except np.linalg.LinAlgError:
+            continue
+
+        # Predict next step using the last available values
+        last_x = np.array([1.0,
+                            rv_d[-1] if np.isfinite(rv_d[-1]) else 0.0,
+                            rv_w.iloc[-1] if hasattr(rv_w, 'iloc') else rv_w[-1],
+                            rv_m.iloc[-1] if hasattr(rv_m, 'iloc') else rv_m[-1]])
+
+        if not np.isfinite(last_x).all():
+            continue
+
+        rv_hat = float(coeffs @ last_x)
+        # Convert variance forecast to annualised volatility (same units as copper_vol)
+        forecast.iloc[i] = np.sqrt(max(rv_hat, 0.0) * 252)
+
+    return forecast
+
+
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
@@ -216,6 +292,10 @@ def build_features(
     series["macd"] = macd_line
     series["macd_signal"] = signal_line
     series["bb_width"] = _bollinger_width(cp)
+
+    # HAR-RV 1-step-ahead volatility forecast (Corsi 2009)
+    _daily_ret = np.log(cp / cp.shift(1))
+    series["har_rv_forecast"] = _har_rv_forecast(_daily_ret)
 
     # -----------------------------------------------------------------------
     # Cross-asset features

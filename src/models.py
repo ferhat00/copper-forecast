@@ -5,12 +5,14 @@ Model definitions, training helpers, and ensemble utilities.
 
 Models
 ------
-NaiveModel        : Random-walk baseline (last observed value → 0 return)
-LinearModel       : Ridge regression benchmark
-XGBoostModel      : XGBoost regressor with Optuna hyper-parameter tuning
-LGBMModel         : LightGBM regressor with Optuna hyper-parameter tuning
-EnsembleModel     : Weighted / simple-average ensemble of the above
-QuantileEnsemble  : Wrap any model with quantile-regression CIs
+NaiveModel           : Random-walk baseline (last observed value → 0 return)
+LinearModel          : Ridge regression benchmark
+XGBoostModel         : XGBoost regressor with Optuna hyper-parameter tuning
+LGBMModel            : LightGBM regressor with Optuna hyper-parameter tuning
+XGBoostClassifier    : XGBoost direction classifier (predict ±1)
+LGBMClassifier       : LightGBM direction classifier (predict ±1)
+EnsembleModel        : Weighted / simple-average ensemble of the above
+QuantileForecaster   : Wrap any model with quantile-regression CIs
 """
 
 from __future__ import annotations
@@ -112,14 +114,14 @@ class XGBoostModel(BaseForecaster):
     """XGBoost regressor, optionally tuned with Optuna."""
 
     DEFAULT_PARAMS: dict[str, Any] = {
-        "n_estimators": 400,
+        "n_estimators": 200,
         "learning_rate": 0.05,
-        "max_depth": 5,
+        "max_depth": 3,
         "subsample": 0.8,
         "colsample_bytree": 0.8,
-        "min_child_weight": 3,
+        "min_child_weight": 10,
         "reg_alpha": 0.1,
-        "reg_lambda": 1.0,
+        "reg_lambda": 5.0,
         "random_state": 42,
         "n_jobs": -1,
         "verbosity": 0,
@@ -213,15 +215,15 @@ class LGBMModel(BaseForecaster):
     """LightGBM regressor, optionally tuned with Optuna."""
 
     DEFAULT_PARAMS: dict[str, Any] = {
-        "n_estimators": 400,
+        "n_estimators": 200,
         "learning_rate": 0.05,
-        "num_leaves": 31,
-        "max_depth": -1,
+        "num_leaves": 15,
+        "max_depth": 3,
         "subsample": 0.8,
         "colsample_bytree": 0.8,
         "reg_alpha": 0.1,
-        "reg_lambda": 1.0,
-        "min_child_samples": 20,
+        "reg_lambda": 5.0,
+        "min_child_samples": 30,
         "random_state": 42,
         "n_jobs": -1,
         "verbose": -1,
@@ -343,6 +345,226 @@ class EnsembleModel(BaseForecaster):
     def name(self) -> str:
         names = "+".join(f.name for f in self.forecasters)
         return f"Ensemble({names})"
+
+
+# ---------------------------------------------------------------------------
+# Direction classifiers (return ±1; evaluated by DA / Signal Sharpe)
+# ---------------------------------------------------------------------------
+
+
+class XGBoostClassifier(BaseForecaster):
+    """XGBoost binary direction classifier.
+
+    Predicts +1 (price up) or -1 (price down).  Trained with
+    ``binary:logistic`` objective on the sign of the return target.
+    Use Signal Sharpe and Directional Accuracy to evaluate — RMSE is
+    meaningless for ±1 outputs.
+
+    Parameters
+    ----------
+    params:
+        Override default XGBoost parameters.
+    """
+
+    DEFAULT_PARAMS: dict[str, Any] = {
+        "n_estimators": 200,
+        "learning_rate": 0.05,
+        "max_depth": 3,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "min_child_weight": 10,
+        "reg_alpha": 0.1,
+        "reg_lambda": 5.0,
+        "random_state": 42,
+        "n_jobs": -1,
+        "verbosity": 0,
+        "eval_metric": "logloss",
+    }
+
+    def __init__(self, params: Optional[dict[str, Any]] = None) -> None:
+        self.params = params or self.DEFAULT_PARAMS.copy()
+        self._model = None
+
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> "XGBoostClassifier":
+        try:
+            from xgboost import XGBClassifier as _XGBClassifier
+        except ImportError as exc:
+            raise ImportError("xgboost is required for XGBoostClassifier") from exc
+
+        # Convert continuous returns to ±1 labels; 0-return → +1
+        y_dir = (np.sign(y.values).astype(int) >= 0).astype(int)  # 0 or 1
+        self._model = _XGBClassifier(**self.params)
+        self._model.fit(X, y_dir)
+        return self
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        if self._model is None:
+            raise RuntimeError("Model not fitted yet.")
+        # Return ±1 to match the return-sign convention used by signal_sharpe
+        proba = self._model.predict_proba(X)[:, 1]
+        return np.where(proba >= 0.5, 1.0, -1.0)
+
+    def tune(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        n_trials: int = 50,
+        cv_splits: int = 5,
+        random_state: int = 42,
+    ) -> dict[str, Any]:
+        """Optuna search for best hyper-parameters (optimises log-loss)."""
+        try:
+            import optuna
+            from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+            from xgboost import XGBClassifier as _XGBClassifier
+        except ImportError as exc:
+            raise ImportError("optuna and xgboost are required for tuning") from exc
+
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        y_dir = (np.sign(y.values).astype(int) >= 0).astype(int)
+        tscv = TimeSeriesSplit(n_splits=cv_splits)
+
+        def objective(trial: optuna.Trial) -> float:
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 100, 600),
+                "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.2, log=True),
+                "max_depth": trial.suggest_int("max_depth", 2, 5),
+                "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+                "min_child_weight": trial.suggest_int("min_child_weight", 5, 20),
+                "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 10.0, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 10.0, log=True),
+                "random_state": random_state,
+                "n_jobs": -1,
+                "verbosity": 0,
+                "eval_metric": "logloss",
+            }
+            scores = cross_val_score(
+                _XGBClassifier(**params), X, y_dir, cv=tscv, scoring="neg_log_loss"
+            )
+            return -scores.mean()
+
+        study = optuna.create_study(
+            direction="minimize",
+            sampler=optuna.samplers.TPESampler(seed=random_state),
+        )
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+        best = study.best_params
+        best.update({"random_state": random_state, "n_jobs": -1, "verbosity": 0,
+                     "eval_metric": "logloss"})
+        self.params = best
+        return best
+
+    @property
+    def name(self) -> str:
+        return "XGBoost (Classifier)"
+
+
+class LGBMClassifier(BaseForecaster):
+    """LightGBM binary direction classifier.
+
+    Predicts +1 (price up) or -1 (price down).  Trained with
+    ``binary`` objective on the sign of the return target.
+    Use Signal Sharpe and Directional Accuracy to evaluate.
+
+    Parameters
+    ----------
+    params:
+        Override default LightGBM parameters.
+    """
+
+    DEFAULT_PARAMS: dict[str, Any] = {
+        "n_estimators": 200,
+        "learning_rate": 0.05,
+        "num_leaves": 15,
+        "max_depth": 3,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "reg_alpha": 0.1,
+        "reg_lambda": 5.0,
+        "min_child_samples": 30,
+        "random_state": 42,
+        "n_jobs": -1,
+        "verbose": -1,
+    }
+
+    def __init__(self, params: Optional[dict[str, Any]] = None) -> None:
+        self.params = params or self.DEFAULT_PARAMS.copy()
+        self._model = None
+
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> "LGBMClassifier":
+        try:
+            from lightgbm import LGBMClassifier as _LGBMClassifier
+        except ImportError as exc:
+            raise ImportError("lightgbm is required for LGBMClassifier") from exc
+
+        y_dir = (np.sign(y.values).astype(int) >= 0).astype(int)  # 0 or 1
+        params = {**self.params, "objective": "binary"}
+        self._model = _LGBMClassifier(**params)
+        self._model.fit(X, y_dir)
+        return self
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        if self._model is None:
+            raise RuntimeError("Model not fitted yet.")
+        proba = self._model.predict_proba(X)[:, 1]
+        return np.where(proba >= 0.5, 1.0, -1.0)
+
+    def tune(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        n_trials: int = 50,
+        cv_splits: int = 5,
+        random_state: int = 42,
+    ) -> dict[str, Any]:
+        """Optuna search for best hyper-parameters (optimises log-loss)."""
+        try:
+            import optuna
+            from lightgbm import LGBMClassifier as _LGBMClassifier
+            from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+        except ImportError as exc:
+            raise ImportError("optuna and lightgbm are required for tuning") from exc
+
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        y_dir = (np.sign(y.values).astype(int) >= 0).astype(int)
+        tscv = TimeSeriesSplit(n_splits=cv_splits)
+
+        def objective(trial: optuna.Trial) -> float:
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 100, 600),
+                "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.2, log=True),
+                "num_leaves": trial.suggest_int("num_leaves", 10, 60),
+                "max_depth": trial.suggest_int("max_depth", 2, 5),
+                "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+                "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 10.0, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 10.0, log=True),
+                "min_child_samples": trial.suggest_int("min_child_samples", 10, 60),
+                "random_state": random_state,
+                "n_jobs": -1,
+                "verbose": -1,
+                "objective": "binary",
+            }
+            scores = cross_val_score(
+                _LGBMClassifier(**params), X, y_dir, cv=tscv, scoring="neg_log_loss"
+            )
+            return -scores.mean()
+
+        study = optuna.create_study(
+            direction="minimize",
+            sampler=optuna.samplers.TPESampler(seed=random_state),
+        )
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+        best = study.best_params
+        best.update({"random_state": random_state, "n_jobs": -1, "verbose": -1,
+                     "objective": "binary"})
+        self.params = best
+        return best
+
+    @property
+    def name(self) -> str:
+        return "LGBM (Classifier)"
 
 
 # ---------------------------------------------------------------------------
