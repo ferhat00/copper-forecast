@@ -49,7 +49,7 @@ def compute_metrics(
     Returns
     -------
     dict with keys: rmse, mae, mape, directional_accuracy, signal_sharpe,
-    information_ratio
+    information_ratio, rmse_skill
     """
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
@@ -59,6 +59,12 @@ def compute_metrics(
 
     rmse = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
     mae = float(np.mean(np.abs(y_true - y_pred)))
+
+    # RMSE skill score vs the zero-prediction (random-walk on log-returns) benchmark.
+    # Naive predicts 0, so its squared error is mean(y_true**2).  A skill of 0 means
+    # "as good as Naive on RMSE"; > 0 beats Naive; < 0 loses to Naive.
+    naive_mse = float(np.mean(y_true ** 2))
+    rmse_skill = float(1.0 - (rmse ** 2) / naive_mse) if naive_mse > 0 else 0.0
 
     # MAPE — guard against zero actuals
     nonzero = y_true != 0
@@ -86,10 +92,11 @@ def compute_metrics(
         "directional_accuracy": da,
         "signal_sharpe": signal_sharpe,
         "information_ratio": information_ratio,
+        "rmse_skill": rmse_skill,
     }
     if name:
-        logger.info("[%s] RMSE=%.4f  MAE=%.4f  MAPE=%.2f%%  DA=%.2f%%  Sharpe=%.2f",
-                    name, rmse, mae, mape, da * 100, signal_sharpe)
+        logger.info("[%s] RMSE=%.4f  MAE=%.4f  MAPE=%.2f%%  DA=%.2f%%  Sharpe=%.2f  Skill=%.4f",
+                    name, rmse, mae, mape, da * 100, signal_sharpe, rmse_skill)
     return metrics
 
 
