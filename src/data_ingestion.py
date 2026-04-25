@@ -10,14 +10,17 @@ Downloads and harmonises raw price / macro data from:
                manufacturing orders, monetary policy, credit conditions,
                inflation, trade, labour market, and commodity spot prices)
 
-All series are aligned to a common daily date-index (business days),
-forward-filled for non-trading gaps, and returned as a single tidy
-DataFrame.
+The ``load_data`` entry point supports two output frequencies:
+  - ``freq="B"`` (default) — daily business-day calendar, backwards-compatible
+  - ``freq="M"`` — month-end calendar with rule-based aggregation
+    (last for prices/FX/equities/futures, mean for yields/spreads/rates,
+    pass-through for already-monthly macro series)
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from datetime import date, timedelta
 from typing import Optional
 
@@ -182,6 +185,69 @@ YFINANCE_TICKERS: dict[str, str] = {
 }
 
 # ---------------------------------------------------------------------------
+# Monthly aggregation rules
+# ---------------------------------------------------------------------------
+# When ``load_data(freq="M")`` is requested, daily series are resampled to
+# month-end. Most price-like columns take the last value of the month; rate
+# and spread columns take the monthly mean. Macro series that already arrive
+# at monthly frequency pass through (their value is preserved by ``last``).
+
+MONTHLY_AGG_MEAN: set[str] = {
+    # FRED yields, spreads, rates — mean smooths thin-day spikes
+    "real_yield_10y", "real_yield_5y",
+    "inflation_be_10y", "inflation_be_5y",
+    "yield_spread_10y2y", "yield_spread_10y3m",
+    "fed_funds_rate",
+    "hy_oas", "ig_oas",
+    "fin_conditions",
+    # yfinance Treasury-yield proxies (noisy intraday)
+    "t3m_yield", "t5y_yield", "t10y_yield", "t30y_yield",
+    # VIX-family — mean better captures the regime than the last day
+    "vix", "vix_3m",
+}
+
+
+def _resample_to_month_end(
+    df: pd.DataFrame,
+    overrides: Optional[dict[str, str]] = None,
+) -> pd.DataFrame:
+    """Resample a daily DataFrame to month-end using per-column rules.
+
+    Default rule: ``last``. Columns listed in ``MONTHLY_AGG_MEAN`` use ``mean``.
+    ``overrides`` can override either default on a per-column basis with values
+    in {"last", "mean", "sum", "first"}.
+    """
+    if df.empty:
+        return df
+    overrides = overrides or {}
+    rules: dict[str, list[str]] = {"last": [], "mean": [], "sum": [], "first": []}
+    for col in df.columns:
+        rule = overrides.get(col)
+        if rule is None:
+            rule = "mean" if col in MONTHLY_AGG_MEAN else "last"
+        if rule not in rules:
+            raise ValueError(f"Unknown monthly aggregation rule '{rule}' for {col}")
+        rules[rule].append(col)
+
+    parts: list[pd.DataFrame] = []
+    for rule, cols in rules.items():
+        if not cols:
+            continue
+        sub = df[cols].resample("ME")
+        agg = getattr(sub, rule)()
+        parts.append(agg)
+    out = pd.concat(parts, axis=1)
+    return out[df.columns]  # preserve original column order
+
+
+def _bd_lag_to_months(lag_bd: int) -> int:
+    """Convert a business-day publication lag to whole months (rounded up)."""
+    if lag_bd <= 0:
+        return 0
+    return max(1, math.ceil(lag_bd / 21))
+
+
+# ---------------------------------------------------------------------------
 # FRED publication lags
 # ---------------------------------------------------------------------------
 # Maps each FRED series column name → number of *business days* to shift
@@ -222,6 +288,7 @@ FRED_PUBLICATION_LAGS: dict[str, int] = {
     "inventory_sales":     45,
     "trade_balance":       35,
     "china_mfg_prod":      45,
+    "china_pmi_nbs":        2,    # NBS releases on the last day of the reference month
     "copper_lme_monthly":  30,
     # Weekly releases — typically published ~5 BD after reference week
     "fin_conditions":      5,    # NFCI
@@ -321,6 +388,9 @@ FRED_SERIES: dict[str, str] = {
 
     # ── China Activity (OECD via FRED) ────────────────────────────────────────
     "china_mfg_prod":      "MANMM101CNM657S", # China Manufacturing Production Index (OECD)
+
+    # ── Activity / sentiment surveys (used by monthly model) ─────────────────
+    "china_pmi_nbs":       "CHNPMINDXM",      # NBS Mfg PMI diffusion index (~2005+)
 }
 
 # ---------------------------------------------------------------------------
@@ -693,6 +763,130 @@ def fetch_eia(
     return df
 
 
+def fetch_metal_inventory(
+    metal: str = "copper",
+    exchange: str = "lme",
+    start: str = "1990-01-01",
+    end: Optional[str] = None,
+) -> pd.DataFrame:
+    """Download physical-metal warehouse inventories from LME or SHFE.
+
+    Uses ``akshare`` (free, no key) which scrapes EastMoney / SMM. Designed
+    for the monthly model — output is daily and the caller resamples to
+    month-end.
+
+    Returns an empty DataFrame on any failure so the pipeline degrades
+    gracefully when ``akshare`` is missing or the upstream is rate-limited.
+    """
+    try:
+        import akshare as ak  # type: ignore
+    except ImportError:
+        logger.warning("akshare not installed; skipping %s %s inventory", exchange, metal)
+        return pd.DataFrame()
+
+    if end is None:
+        end = date.today().isoformat()
+
+    metal = metal.lower()
+    exchange = exchange.lower()
+    try:
+        if exchange == "lme":
+            raw = ak.futures_inventory_99(exchange="LME", symbol=metal.capitalize())
+        elif exchange == "shfe":
+            raw = ak.futures_inventory_em(symbol="铜")  # SHFE copper, name in CN
+        else:
+            logger.warning("Unknown inventory exchange '%s'", exchange)
+            return pd.DataFrame()
+    except Exception as exc:
+        logger.warning("%s %s inventory fetch failed: %s", exchange, metal, exc)
+        return pd.DataFrame()
+
+    if raw is None or len(raw) == 0:
+        return pd.DataFrame()
+
+    # akshare returns a DataFrame with date and inventory columns; map
+    # defensively because column names vary by version
+    raw = raw.copy()
+    date_col = next((c for c in raw.columns if "日期" in str(c) or str(c).lower() in {"date", "datetime"}), None)
+    val_col = next((c for c in raw.columns if "库存" in str(c) or "inventory" in str(c).lower() or "stocks" in str(c).lower()), None)
+    if date_col is None or val_col is None:
+        logger.warning("%s inventory: could not infer date/value columns from %s", exchange, list(raw.columns))
+        return pd.DataFrame()
+
+    out = raw[[date_col, val_col]].rename(columns={date_col: "date", val_col: f"{exchange}_{metal}_inv"})
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    out = out.dropna(subset=["date"]).set_index("date").sort_index()
+    out = out.loc[start:end]
+    logger.info("%s %s inventory: %d obs", exchange, metal, len(out))
+    return out
+
+
+def fetch_chile_copper_exports(
+    start: str = "1990-01-01",
+    end: Optional[str] = None,
+    bcch_api_key: Optional[str] = None,
+) -> pd.DataFrame:
+    """Download Chilean copper export volume from Banco Central de Chile.
+
+    Uses the BCCh SieteRest web service (free with registration). Returns an
+    empty DataFrame if the key is missing or the upstream is unreachable.
+    """
+    import os
+
+    try:
+        import requests
+    except ImportError:
+        logger.warning("requests not installed; skipping BCCh fetch")
+        return pd.DataFrame()
+
+    key = bcch_api_key or os.environ.get("BCCH_API_KEY")
+    if not key:
+        logger.info("No BCCh API key — skipping Chile copper export fetch")
+        return pd.DataFrame()
+
+    if end is None:
+        end = date.today().isoformat()
+
+    # Series F019.PEC.MIN.M.M = monthly copper export volumes (USD millions)
+    base_url = "https://si3.bcentral.cl/SieteRestWS/SieteRestWS.ashx"
+    params = {
+        "user": "",  # BCCh requires user/pass; placeholder, override via key
+        "pass": key,
+        "function": "GetSeries",
+        "timeseries": "F019.PEC.MIN.M.M",
+        "firstdate": start,
+        "lastdate": end,
+    }
+    try:
+        resp = requests.get(base_url, params=params, timeout=20)
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception as exc:
+        logger.warning("BCCh fetch failed: %s", exc)
+        return pd.DataFrame()
+
+    obs = payload.get("Series", {}).get("Obs") or []
+    if not obs:
+        logger.warning("BCCh returned no observations")
+        return pd.DataFrame()
+
+    records = []
+    for o in obs:
+        try:
+            dt = pd.to_datetime(o["indexDateString"], dayfirst=True, errors="coerce")
+            v = float(o["value"])
+            if pd.notna(dt):
+                records.append((dt, v))
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    if not records:
+        return pd.DataFrame()
+
+    s = pd.Series(dict(records), name="chile_cu_exports").sort_index()
+    return s.to_frame()
+
+
 def load_data(
     start: str = "2010-01-01",
     end: Optional[str] = None,
@@ -701,6 +895,12 @@ def load_data(
     nasdaq_api_key: Optional[str] = None,
     alpha_vantage_api_key: Optional[str] = None,
     eia_api_key: Optional[str] = None,
+    freq: str = "B",
+    bcch_api_key: Optional[str] = None,
+    include_lme_inventory: bool = False,
+    include_shfe_inventory: bool = False,
+    include_chile_supply: bool = False,
+    monthly_agg_overrides: Optional[dict[str, str]] = None,
 ) -> pd.DataFrame:
     """Fetch all data sources and return a single aligned DataFrame.
 
@@ -737,31 +937,51 @@ def load_data(
     pd.DataFrame
         Combined DataFrame with daily frequency and all available columns.
     """
+    if freq not in {"B", "M"}:
+        raise ValueError(f"freq must be 'B' (business-daily) or 'M' (monthly); got {freq!r}")
+
+    # Pick lag conversion: business days for daily output, months for monthly
+    def _lag(col: str) -> int:
+        bd = FRED_PUBLICATION_LAGS.get(col, 0)
+        return _bd_lag_to_months(bd) if freq == "M" else bd
+
     yf_df = fetch_yfinance(start=start, end=end)
     fred_df = fetch_fred(start=start, end=end, fred_api_key=fred_api_key)
 
-    # Reindex FRED to the yfinance business-day calendar, then apply publication
-    # lags as integer shifts. Shifting with freq="B" on a union index that
-    # contains non-business-day labels (e.g. monthly series dated on a weekend)
-    # rolls adjacent weekend/weekday labels onto the same target date, producing
-    # duplicate labels that break the subsequent column assignment.
-    fred_daily = fred_df.reindex(yf_df.index, method="ffill")
-    for col, lag_bd in FRED_PUBLICATION_LAGS.items():
-        if col in fred_daily.columns and lag_bd > 0:
-            fred_daily[col] = fred_daily[col].shift(lag_bd)
+    if freq == "M":
+        # Resample yfinance prices first, then build the master month-end calendar
+        yf_master = _resample_to_month_end(yf_df, overrides=monthly_agg_overrides)
+        master_idx = yf_master.index
+        # FRED series may already be monthly-stamped on awkward dates — align to ME
+        fred_master = _resample_to_month_end(fred_df, overrides=monthly_agg_overrides)
+        fred_master = fred_master.reindex(master_idx, method="ffill")
+    else:
+        master_idx = yf_df.index
+        yf_master = yf_df
+        fred_master = fred_df.reindex(master_idx, method="ffill")
 
-    df = pd.concat([yf_df, fred_daily], axis=1)
+    for col in fred_master.columns:
+        lag = _lag(col)
+        if lag > 0:
+            fred_master[col] = fred_master[col].shift(lag)
+
+    df = pd.concat([yf_master, fred_master], axis=1)
 
     # Alpha Vantage: LME / World Bank monthly commodity prices
     if alpha_vantage_api_key:
         av_df = fetch_alpha_vantage(start=start, end=end, api_key=alpha_vantage_api_key)
         if not av_df.empty:
-            av_daily = av_df.reindex(df.index, method="ffill")
-            for col, lag_bd in FRED_PUBLICATION_LAGS.items():
-                if col in av_daily.columns and lag_bd > 0:
-                    av_daily[col] = av_daily[col].shift(lag_bd)
-            df = pd.concat([df, av_daily], axis=1)
-            logger.info("Alpha Vantage data integrated: %d columns added", av_daily.shape[1])
+            if freq == "M":
+                av_aligned = _resample_to_month_end(av_df, overrides=monthly_agg_overrides)
+                av_aligned = av_aligned.reindex(master_idx, method="ffill")
+            else:
+                av_aligned = av_df.reindex(master_idx, method="ffill")
+            for col in av_aligned.columns:
+                lag = _lag(col)
+                if lag > 0:
+                    av_aligned[col] = av_aligned[col].shift(lag)
+            df = pd.concat([df, av_aligned], axis=1)
+            logger.info("Alpha Vantage data integrated: %d columns added", av_aligned.shape[1])
     else:
         av_df = pd.DataFrame()
 
@@ -769,17 +989,22 @@ def load_data(
     if eia_api_key:
         eia_df = fetch_eia(start=start, end=end, api_key=eia_api_key)
         if not eia_df.empty:
-            eia_daily = eia_df.reindex(df.index, method="ffill")
-            for col, lag_bd in FRED_PUBLICATION_LAGS.items():
-                if col in eia_daily.columns and lag_bd > 0:
-                    eia_daily[col] = eia_daily[col].shift(lag_bd)
-            df = pd.concat([df, eia_daily], axis=1)
-            logger.info("EIA data integrated: %d columns added", eia_daily.shape[1])
+            if freq == "M":
+                eia_aligned = _resample_to_month_end(eia_df, overrides=monthly_agg_overrides)
+                eia_aligned = eia_aligned.reindex(master_idx, method="ffill")
+            else:
+                eia_aligned = eia_df.reindex(master_idx, method="ffill")
+            for col in eia_aligned.columns:
+                lag = _lag(col)
+                if lag > 0:
+                    eia_aligned[col] = eia_aligned[col].shift(lag)
+            df = pd.concat([df, eia_aligned], axis=1)
+            logger.info("EIA data integrated: %d columns added", eia_aligned.shape[1])
     else:
         eia_df = pd.DataFrame()
 
-    # COT positioning data
-    if include_cot:
+    # COT positioning data (skipped for monthly — daily-only signal)
+    if include_cot and freq == "B":
         try:
             from src.cot_data import align_cot_to_daily, fetch_cot_data
             cot = fetch_cot_data(start=start, end=end, api_key=nasdaq_api_key)
@@ -789,11 +1014,39 @@ def load_data(
         except Exception as exc:
             logger.warning("COT data unavailable: %s", exc)
 
+    # Monthly-only optional sources
+    if freq == "M":
+        for inv_flag, exch in (
+            (include_lme_inventory, "lme"),
+            (include_shfe_inventory, "shfe"),
+        ):
+            if not inv_flag:
+                continue
+            inv_df = fetch_metal_inventory(metal="copper", exchange=exch, start=start, end=end)
+            if inv_df.empty:
+                continue
+            inv_monthly = _resample_to_month_end(inv_df).reindex(master_idx, method="ffill")
+            df = pd.concat([df, inv_monthly], axis=1)
+            logger.info("%s inventory integrated: %d columns added", exch.upper(), inv_monthly.shape[1])
+
+        if include_chile_supply:
+            chile_df = fetch_chile_copper_exports(start=start, end=end, bcch_api_key=bcch_api_key)
+            if not chile_df.empty:
+                chile_monthly = _resample_to_month_end(chile_df).reindex(master_idx, method="ffill")
+                # Apply a 1-month publication lag (BCCh releases ~3-4 weeks after month-end)
+                chile_monthly = chile_monthly.shift(1)
+                df = pd.concat([df, chile_monthly], axis=1)
+                logger.info("BCCh Chile supply integrated: %d columns added", chile_monthly.shape[1])
+
     df = df.sort_index()
-    df = df.ffill(limit=5)
+    if freq == "B":
+        df = df.ffill(limit=5)
+    else:
+        # Monthly: bridge isolated NaN months but don't paper over multi-month gaps
+        df = df.ffill(limit=2)
 
     # Drop rows where the target is still NaN
     df = df.dropna(subset=["copper_price"])
 
-    logger.info("Combined dataset: %d rows × %d columns", *df.shape)
+    logger.info("Combined dataset (%s): %d rows × %d columns", freq, *df.shape)
     return df

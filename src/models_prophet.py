@@ -87,13 +87,16 @@ class ProphetModel(BaseForecaster):
         # Drop NaN rows
         df_prophet = df_prophet.dropna()
 
-        # Create and configure model
+        # Create and configure model. Defaults match the daily pipeline; the
+        # monthly notebook overrides weekly_seasonality=False + seasonality_mode
+        # via the kwargs forwarded from __init__.
+        prophet_kwargs = dict(self._prophet_kwargs)
+        prophet_kwargs.setdefault("daily_seasonality", False)
+        prophet_kwargs.setdefault("weekly_seasonality", True)
+        prophet_kwargs.setdefault("yearly_seasonality", True)
         self._model = Prophet(
             interval_width=self.interval_width,
-            daily_seasonality=False,
-            weekly_seasonality=True,
-            yearly_seasonality=True,
-            **self._prophet_kwargs,
+            **prophet_kwargs,
         )
         for col in self._regressor_cols:
             self._model.add_regressor(col)
