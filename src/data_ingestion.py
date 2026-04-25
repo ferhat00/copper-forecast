@@ -740,14 +740,15 @@ def load_data(
     yf_df = fetch_yfinance(start=start, end=end)
     fred_df = fetch_fred(start=start, end=end, fred_api_key=fred_api_key)
 
-    # Apply publication lags before forward-filling so that the model can
-    # only see a series after it would realistically have been released.
-    for col, lag_bd in FRED_PUBLICATION_LAGS.items():
-        if col in fred_df.columns and lag_bd > 0:
-            fred_df[col] = fred_df[col].shift(lag_bd, freq="B")
-
-    # Reindex FRED to the yfinance business-day calendar
+    # Reindex FRED to the yfinance business-day calendar, then apply publication
+    # lags as integer shifts. Shifting with freq="B" on a union index that
+    # contains non-business-day labels (e.g. monthly series dated on a weekend)
+    # rolls adjacent weekend/weekday labels onto the same target date, producing
+    # duplicate labels that break the subsequent column assignment.
     fred_daily = fred_df.reindex(yf_df.index, method="ffill")
+    for col, lag_bd in FRED_PUBLICATION_LAGS.items():
+        if col in fred_daily.columns and lag_bd > 0:
+            fred_daily[col] = fred_daily[col].shift(lag_bd)
 
     df = pd.concat([yf_df, fred_daily], axis=1)
 
@@ -755,10 +756,10 @@ def load_data(
     if alpha_vantage_api_key:
         av_df = fetch_alpha_vantage(start=start, end=end, api_key=alpha_vantage_api_key)
         if not av_df.empty:
-            for col, lag_bd in FRED_PUBLICATION_LAGS.items():
-                if col in av_df.columns and lag_bd > 0:
-                    av_df[col] = av_df[col].shift(lag_bd, freq="B")
             av_daily = av_df.reindex(df.index, method="ffill")
+            for col, lag_bd in FRED_PUBLICATION_LAGS.items():
+                if col in av_daily.columns and lag_bd > 0:
+                    av_daily[col] = av_daily[col].shift(lag_bd)
             df = pd.concat([df, av_daily], axis=1)
             logger.info("Alpha Vantage data integrated: %d columns added", av_daily.shape[1])
     else:
@@ -768,10 +769,10 @@ def load_data(
     if eia_api_key:
         eia_df = fetch_eia(start=start, end=end, api_key=eia_api_key)
         if not eia_df.empty:
-            for col, lag_bd in FRED_PUBLICATION_LAGS.items():
-                if col in eia_df.columns and lag_bd > 0:
-                    eia_df[col] = eia_df[col].shift(lag_bd, freq="B")
             eia_daily = eia_df.reindex(df.index, method="ffill")
+            for col, lag_bd in FRED_PUBLICATION_LAGS.items():
+                if col in eia_daily.columns and lag_bd > 0:
+                    eia_daily[col] = eia_daily[col].shift(lag_bd)
             df = pd.concat([df, eia_daily], axis=1)
             logger.info("EIA data integrated: %d columns added", eia_daily.shape[1])
     else:
