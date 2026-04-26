@@ -243,6 +243,13 @@ def build_features(
     lags: Optional[list[int]] = None,
     horizons: Optional[list[int]] = None,
     primary_horizon: int = 22,
+    return_lags: Optional[list[int]] = None,
+    vol_windows: Optional[list[int]] = None,
+    ma_window: int = 200,
+    annualisation_factor: float = float(np.sqrt(252)),
+    yoy_periods: int = 252,
+    include_intraday: bool = True,
+    horizon_unit: str = "d",
 ) -> pd.DataFrame:
     """Construct the full feature matrix from the raw DataFrame.
 
@@ -251,11 +258,35 @@ def build_features(
     df:
         Output of :func:`src.data_ingestion.load_data`.
     lags:
-        List of look-back periods (days) to use for lagged features.
+        List of look-back periods to use for lagged features.
     horizons:
-        Forward horizons (days) for which to compute target variables.
+        Forward horizons for which to compute target variables. Units are
+        rows (= business days for the daily pipeline, = months for monthly).
     primary_horizon:
         The main forecast horizon; its target columns are not lagged.
+    return_lags:
+        Window sizes for ``copper_ret_{n}{unit}`` and ``dxy_ret_{n}{unit}``
+        cross-asset return features. Defaults to the daily set ``[1, 5, 22]``;
+        the monthly notebook should pass ``[1, 3, 6, 12]``.
+    vol_windows:
+        Rolling-window sizes for ``copper_vol_{n}{unit}``. Defaults to the
+        daily set ``[5, 22, 66]``.
+    ma_window:
+        Window for the price moving-average / z-score feature
+        (``copper_zscore_{N}{unit}``).
+    annualisation_factor:
+        Multiplier on the rolling std of returns. ``sqrt(252)`` for daily,
+        ``sqrt(12)`` for monthly.
+    yoy_periods:
+        Number of rows representing one year — 252 for daily, 12 for monthly.
+        Used for ``indpro_yoy``.
+    include_intraday:
+        When False (monthly mode), skip RSI/MACD/Bollinger/HAR-RV/CNY/options-
+        expiry/quarter-end-flag/US-holiday-flag features that are meaningless
+        on monthly bars.
+    horizon_unit:
+        Suffix used in target/feature column names. ``"d"`` (default) preserves
+        the historical schema; the monthly notebook passes ``"m"``.
 
     Returns
     -------
@@ -267,7 +298,12 @@ def build_features(
         lags = DEFAULT_LAGS
     if horizons is None:
         horizons = DEFAULT_HORIZONS
+    if return_lags is None:
+        return_lags = [1, 5, 22]
+    if vol_windows is None:
+        vol_windows = [5, 22, 66]
 
+    u = horizon_unit
     cp = df["copper_price"]
     idx = df.index
     series: dict[str, pd.Series] = {}
@@ -275,27 +311,27 @@ def build_features(
     # -----------------------------------------------------------------------
     # Price-derived features
     # -----------------------------------------------------------------------
-    for n in [1, 5, 22]:
-        series[f"copper_ret_{n}d"] = np.log(cp / cp.shift(n))
+    for n in return_lags:
+        series[f"copper_ret_{n}{u}"] = np.log(cp / cp.shift(n))
 
-    for n in [5, 22, 66]:
-        series[f"copper_vol_{n}d"] = (
-            np.log(cp / cp.shift(1)).rolling(n).std() * np.sqrt(252)
+    for n in vol_windows:
+        series[f"copper_vol_{n}{u}"] = (
+            np.log(cp / cp.shift(1)).rolling(n).std() * annualisation_factor
         )
 
-    ma200 = cp.rolling(200).mean()
-    std200 = cp.rolling(200).std()
-    series["copper_zscore_200d"] = (cp - ma200) / std200.replace(0, np.nan)
+    ma = cp.rolling(ma_window).mean()
+    std = cp.rolling(ma_window).std()
+    series[f"copper_zscore_{ma_window}{u}"] = (cp - ma) / std.replace(0, np.nan)
 
-    series["rsi_14"] = _wilder_rsi(cp)
-    macd_line, signal_line = _macd(cp)
-    series["macd"] = macd_line
-    series["macd_signal"] = signal_line
-    series["bb_width"] = _bollinger_width(cp)
-
-    # HAR-RV 1-step-ahead volatility forecast (Corsi 2009)
-    _daily_ret = np.log(cp / cp.shift(1))
-    series["har_rv_forecast"] = _har_rv_forecast(_daily_ret)
+    if include_intraday:
+        series["rsi_14"] = _wilder_rsi(cp)
+        macd_line, signal_line = _macd(cp)
+        series["macd"] = macd_line
+        series["macd_signal"] = signal_line
+        series["bb_width"] = _bollinger_width(cp)
+        # HAR-RV 1-step-ahead volatility forecast (Corsi 2009)
+        _daily_ret = np.log(cp / cp.shift(1))
+        series["har_rv_forecast"] = _har_rv_forecast(_daily_ret)
 
     # -----------------------------------------------------------------------
     # Cross-asset features
@@ -311,29 +347,41 @@ def build_features(
 
     if "dxy" in df.columns:
         series["dxy_level"] = df["dxy"]
-        for n in [1, 5, 22]:
-            series[f"dxy_ret_{n}d"] = np.log(df["dxy"] / df["dxy"].shift(n))
+        for n in return_lags:
+            series[f"dxy_ret_{n}{u}"] = np.log(df["dxy"] / df["dxy"].shift(n))
 
     if "cny_usd" in df.columns:
         series["cny_usd_level"] = df["cny_usd"]
 
     if "sp500" in df.columns:
-        for n in [1, 5, 22]:
-            series[f"sp500_ret_{n}d"] = np.log(df["sp500"] / df["sp500"].shift(n))
+        for n in return_lags:
+            series[f"sp500_ret_{n}{u}"] = np.log(df["sp500"] / df["sp500"].shift(n))
 
     # -----------------------------------------------------------------------
     # Macro / fundamental features
     # -----------------------------------------------------------------------
     if "indpro" in df.columns:
-        series["indpro_yoy"] = df["indpro"].pct_change(252)
+        series["indpro_yoy"] = df["indpro"].pct_change(yoy_periods)
 
     if "real_yield_10y" in df.columns:
         series["real_yield_level"] = df["real_yield_10y"]
-        for n in [1, 5, 22]:
-            series[f"real_yield_change_{n}d"] = df["real_yield_10y"].diff(n)
+        for n in return_lags:
+            series[f"real_yield_change_{n}{u}"] = df["real_yield_10y"].diff(n)
 
     if "inflation_breakeven" in df.columns:
         series["infl_be_level"] = df["inflation_breakeven"]
+
+    # ── Monthly-only fundamental features (gracefully skipped if absent) ─────
+    if "china_pmi_nbs" in df.columns:
+        series["china_pmi_diffusion"] = df["china_pmi_nbs"] - 50.0
+    if "china_mfg_prod" in df.columns:
+        series["china_mfg_yoy"] = df["china_mfg_prod"].pct_change(yoy_periods)
+    for inv_col in ("lme_copper_inv", "shfe_copper_inv"):
+        if inv_col in df.columns:
+            series[f"{inv_col}_chg_3"] = df[inv_col].pct_change(3)
+            series[f"{inv_col}_level"] = df[inv_col]
+    if "chile_cu_exports" in df.columns:
+        series["chile_cu_exports_yoy"] = df["chile_cu_exports"].pct_change(yoy_periods)
 
     # -----------------------------------------------------------------------
     # Calendar features
@@ -341,10 +389,11 @@ def build_features(
     month = idx.month
     series["month_sin"] = pd.Series(np.sin(2 * np.pi * month / 12), index=idx)
     series["month_cos"] = pd.Series(np.cos(2 * np.pi * month / 12), index=idx)
-    series["cny_flag"] = _cny_flag(idx)
-    series["quarter_end_flag"] = _quarter_end_flag(idx)
-    series["us_holiday_flag"] = _us_holiday_flag(idx)
-    series["options_expiry_flag"] = _options_expiry_flag(idx)
+    if include_intraday:
+        series["cny_flag"] = _cny_flag(idx)
+        series["quarter_end_flag"] = _quarter_end_flag(idx)
+        series["us_holiday_flag"] = _us_holiday_flag(idx)
+        series["options_expiry_flag"] = _options_expiry_flag(idx)
 
     # Build base DataFrame in one concat to avoid fragmentation
     base_df = pd.concat(series, axis=1)
@@ -365,8 +414,8 @@ def build_features(
     # -----------------------------------------------------------------------
     target_series: dict[str, pd.Series] = {}
     for h in horizons:
-        target_series[f"target_ret_{h}d"] = np.log(cp.shift(-h) / cp)
-        target_series[f"target_price_{h}d"] = cp.shift(-h)
+        target_series[f"target_ret_{h}{u}"] = np.log(cp.shift(-h) / cp)
+        target_series[f"target_price_{h}{u}"] = cp.shift(-h)
     target_series["copper_price"] = cp
 
     target_df = pd.concat(target_series, axis=1)
@@ -381,6 +430,7 @@ def split_features_targets(
     feats: pd.DataFrame,
     horizon: int = 22,
     drop_nan: bool = True,
+    horizon_unit: str = "d",
 ) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
     """Separate features, target return series, and target price series.
 
@@ -402,8 +452,8 @@ def split_features_targets(
     y_price : pd.Series
         Forward price target.
     """
-    target_ret_col = f"target_ret_{horizon}d"
-    target_price_col = f"target_price_{horizon}d"
+    target_ret_col = f"target_ret_{horizon}{horizon_unit}"
+    target_price_col = f"target_price_{horizon}{horizon_unit}"
 
     # Exclude all target columns and raw copper_price from features
     target_cols = [c for c in feats.columns if c.startswith("target_")] + ["copper_price"]
