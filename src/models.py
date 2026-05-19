@@ -153,21 +153,28 @@ class XGBoostModel(BaseForecaster):
         n_trials: int = 50,
         cv_splits: int = 5,
         random_state: int = 42,
+        horizon: int = 1,
     ) -> dict[str, Any]:
         """Use Optuna to search for optimal hyper-parameters.
+
+        Uses :class:`PurgedTimeSeriesSplit` so the last ``horizon - 1`` rows
+        of each training fold are dropped, preventing label-overlap leakage
+        (López de Prado, AFML Ch. 7).
 
         Returns the best parameter dict (also stored in ``self.params``).
         """
         try:
             import optuna
-            from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+            from sklearn.model_selection import cross_val_score
             from xgboost import XGBRegressor
         except ImportError as exc:
             raise ImportError("optuna and xgboost are required for tuning") from exc
 
+        from src.evaluation import PurgedTimeSeriesSplit
+
         optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-        tscv = TimeSeriesSplit(n_splits=cv_splits)
+        tscv = PurgedTimeSeriesSplit(n_splits=cv_splits, horizon=horizon)
 
         def objective(trial: optuna.Trial) -> float:
             params = {
@@ -255,17 +262,25 @@ class LGBMModel(BaseForecaster):
         n_trials: int = 50,
         cv_splits: int = 5,
         random_state: int = 42,
+        horizon: int = 1,
     ) -> dict[str, Any]:
-        """Use Optuna to search for optimal hyper-parameters."""
+        """Use Optuna to search for optimal hyper-parameters.
+
+        Uses :class:`PurgedTimeSeriesSplit` so the last ``horizon - 1`` rows
+        of each training fold are dropped, preventing label-overlap leakage
+        (López de Prado, AFML Ch. 7).
+        """
         try:
             import optuna
             from lightgbm import LGBMRegressor
-            from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+            from sklearn.model_selection import cross_val_score
         except ImportError as exc:
             raise ImportError("optuna and lightgbm are required for tuning") from exc
 
+        from src.evaluation import PurgedTimeSeriesSplit
+
         optuna.logging.set_verbosity(optuna.logging.WARNING)
-        tscv = TimeSeriesSplit(n_splits=cv_splits)
+        tscv = PurgedTimeSeriesSplit(n_splits=cv_splits, horizon=horizon)
 
         def objective(trial: optuna.Trial) -> float:
             params = {
@@ -411,18 +426,26 @@ class XGBoostClassifier(BaseForecaster):
         n_trials: int = 50,
         cv_splits: int = 5,
         random_state: int = 42,
+        horizon: int = 1,
     ) -> dict[str, Any]:
-        """Optuna search for best hyper-parameters (optimises log-loss)."""
+        """Optuna search for best hyper-parameters (optimises log-loss).
+
+        Uses :class:`PurgedTimeSeriesSplit` so the last ``horizon - 1`` rows
+        of each training fold are dropped, preventing label-overlap leakage
+        (López de Prado, AFML Ch. 7).
+        """
         try:
             import optuna
-            from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+            from sklearn.model_selection import cross_val_score
             from xgboost import XGBClassifier as _XGBClassifier
         except ImportError as exc:
             raise ImportError("optuna and xgboost are required for tuning") from exc
 
+        from src.evaluation import PurgedTimeSeriesSplit
+
         optuna.logging.set_verbosity(optuna.logging.WARNING)
         y_dir = (np.sign(y.values).astype(int) >= 0).astype(int)
-        tscv = TimeSeriesSplit(n_splits=cv_splits)
+        tscv = PurgedTimeSeriesSplit(n_splits=cv_splits, horizon=horizon)
 
         def objective(trial: optuna.Trial) -> float:
             params = {
@@ -517,18 +540,26 @@ class LGBMClassifier(BaseForecaster):
         n_trials: int = 50,
         cv_splits: int = 5,
         random_state: int = 42,
+        horizon: int = 1,
     ) -> dict[str, Any]:
-        """Optuna search for best hyper-parameters (optimises log-loss)."""
+        """Optuna search for best hyper-parameters (optimises log-loss).
+
+        Uses :class:`PurgedTimeSeriesSplit` so the last ``horizon - 1`` rows
+        of each training fold are dropped, preventing label-overlap leakage
+        (López de Prado, AFML Ch. 7).
+        """
         try:
             import optuna
             from lightgbm import LGBMClassifier as _LGBMClassifier
-            from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+            from sklearn.model_selection import cross_val_score
         except ImportError as exc:
             raise ImportError("optuna and lightgbm are required for tuning") from exc
 
+        from src.evaluation import PurgedTimeSeriesSplit
+
         optuna.logging.set_verbosity(optuna.logging.WARNING)
         y_dir = (np.sign(y.values).astype(int) >= 0).astype(int)
-        tscv = TimeSeriesSplit(n_splits=cv_splits)
+        tscv = PurgedTimeSeriesSplit(n_splits=cv_splits, horizon=horizon)
 
         def objective(trial: optuna.Trial) -> float:
             params = {
