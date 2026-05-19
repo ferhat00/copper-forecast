@@ -9,7 +9,19 @@
       "Bash(python3 -c ':*)",
       "Bash(python -c \"from src.data_ingestion import YFINANCE_TICKERS, ALPHA_VANTAGE_COMMODITIES, EIA_COPPER_SERIES, fetch_alpha_vantage, fetch_eia, load_data; print\\('yfinance tickers:', len\\(YFINANCE_TICKERS\\)\\); print\\('AV commodities:', list\\(ALPHA_VANTAGE_COMMODITIES.keys\\(\\)\\)\\); print\\('EIA series:', list\\(EIA_COPPER_SERIES.keys\\(\\)\\)\\); print\\('load_data signature OK'\\)\")",
       "Bash(grep -rl \"config\" /c/Users/Ferhat/Documents/GitHub/copper-forecast/src/ /c/Users/Ferhat/Documents/GitHub/copper-forecast/*.ipynb /c/Users/Ferhat/Documents/GitHub/copper-forecast/*.py)",
-      "Bash(ls config*.yaml)"
+      "Bash(ls config*.yaml)",
+      "Bash(python3 -c \"import json; nb = json.load\\(open\\('/c/Users/Ferhat/Documents/GitHub/copper-forecast/copper_forecast_1d.ipynb'\\)\\); cells = [c for c in nb['cells'] if 'best' in str\\(c\\).lower\\(\\) or 'select' in str\\(c\\).lower\\(\\) or 'argmin' in str\\(c\\).lower\\(\\)]; print\\(f'Found {len\\(cells\\)} cells matching selection criteria'\\)\")",
+      "Bash(grep -E \"\\\\.py$|\\\\.yaml$|\\\\.ipynb$|outputs\")",
+      "Bash(python3)",
+      "Bash(awk '/\"id\":/ {id=$0; line=NR} NR==1209 {print \"1209 cell id \\(last seen\\):\", id, \"at line\", line}' \"c:/Users/Ferhat/Documents/GitHub/copper-forecast/copper_forecast_kaggle.ipynb\")",
+      "Bash(awk '/\"id\":/ {id=$0; line=NR} NR==1384 {print \"1384 cell id \\(last seen\\):\", id, \"at line\", line}' \"c:/Users/Ferhat/Documents/GitHub/copper-forecast/copper_forecast_kaggle.ipynb\")",
+      "Bash(python -c ' *)",
+      "Bash(python _build_monthly_nb.py)",
+      "Bash(python -c \"import json; nb = json.load\\(open\\('copper_forecast_kaggle_monthly.ipynb'\\)\\); print\\(f'Cells: {len\\(nb[\\\\\"cells\\\\\"]\\)}, format {nb[\\\\\"nbformat\\\\\"]}.{nb[\\\\\"nbformat_minor\\\\\"]}'\\); print\\('Cell types:', {c['cell_type']: sum\\(1 for x in nb['cells'] if x['cell_type']==c['cell_type']\\) for c in nb['cells']}\\)\")",
+      "Bash(rm _build_monthly_nb.py)",
+      "Bash(python _build_local_monthly.py)",
+      "Bash(python -m pytest tests/test_purged_cv.py -v)",
+      "Bash(python -m pytest tests/ -v)"
     ]
   }
 }

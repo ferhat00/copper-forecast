@@ -39,6 +39,11 @@ class StackingEnsemble(BaseForecaster):
         Initial training window for generating OOF predictions.
     oof_step:
         Step size for walk-forward OOF generation.
+    horizon:
+        Label horizon in rows.  Forwarded to :func:`walk_forward_cv` so that
+        the last ``horizon - 1`` rows of each training fold are purged when
+        generating OOF predictions (López de Prado, AFML Ch. 7).  Default
+        1 disables purging.
     """
 
     def __init__(
@@ -47,6 +52,7 @@ class StackingEnsemble(BaseForecaster):
         meta_learner: Optional[Any] = None,
         oof_initial_size: int = 504,
         oof_step: int = 22,
+        horizon: int = 1,
     ) -> None:
         if not base_models:
             raise ValueError("base_models must be a non-empty list")
@@ -54,6 +60,7 @@ class StackingEnsemble(BaseForecaster):
         self.meta_learner = meta_learner or Ridge(alpha=1.0)
         self.oof_initial_size = oof_initial_size
         self.oof_step = oof_step
+        self.horizon = horizon
         self._fitted_models: list[BaseForecaster] = []
         self._meta_fitted = False
 
@@ -76,6 +83,7 @@ class StackingEnsemble(BaseForecaster):
                     model_copy, X, y,
                     initial_train_size=self.oof_initial_size,
                     step_size=self.oof_step,
+                    horizon=self.horizon,
                 )
                 oof_frames[model.name] = cv_df["y_pred"]
                 logger.info(

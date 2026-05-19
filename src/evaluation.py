@@ -5,16 +5,24 @@ Walk-forward cross-validation and forecast evaluation metrics.
 
 Functions
 ---------
-walk_forward_cv      : Expanding-window CV returning per-fold predictions
+walk_forward_cv      : Expanding-window CV with label-overlap purging
 directional_accuracy : % of predictions with correct sign of change
 compute_metrics      : RMSE, MAE, MAPE, DA for a prediction series
 compare_models       : Run multiple forecasters through walk-forward CV
+out_of_sample_backtest : Hold-out backtest with label-overlap purging
+
+Classes
+-------
+PurgedTimeSeriesSplit : sklearn-compatible time-series splitter that drops
+                        the trailing ``horizon - 1`` rows from each training
+                        fold (López de Prado, *Advances in Financial Machine
+                        Learning*, Ch. 7).
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Iterator, Optional
 
 import numpy as np
 import pandas as pd
@@ -121,6 +129,74 @@ def directional_accuracy(
 
 
 # ---------------------------------------------------------------------------
+# Purged time-series splitter (López de Prado, AFML Ch. 7)
+# ---------------------------------------------------------------------------
+
+
+class PurgedTimeSeriesSplit:
+    """Sklearn-compatible time-series splitter with label-overlap purging.
+
+    Mirrors :class:`sklearn.model_selection.TimeSeriesSplit` fold geometry,
+    but drops the trailing ``horizon - 1 + gap`` rows from each training
+    fold so labels constructed as ``y_t = f(prices[t..t+horizon])`` cannot
+    overlap the test fold.
+
+    Per López de Prado (*Advances in Financial Machine Learning*, §7.4),
+    an embargo on the right edge of the test fold is unnecessary when
+    training always precedes testing (the walk-forward / TimeSeriesSplit
+    layout), so ``gap`` defaults to 0.
+
+    Parameters
+    ----------
+    n_splits:
+        Number of folds (matches ``TimeSeriesSplit`` semantics).
+    horizon:
+        Label horizon in rows.  ``horizon - 1`` rows are purged from the
+        tail of each training fold.  Use 1 to disable purging.
+    gap:
+        Extra rows to purge beyond ``horizon - 1`` (right-side embargo).
+    """
+
+    def __init__(self, n_splits: int = 5, horizon: int = 1, gap: int = 0) -> None:
+        if n_splits < 2:
+            raise ValueError(f"n_splits must be >= 2, got {n_splits}")
+        if horizon < 1:
+            raise ValueError(f"horizon must be >= 1, got {horizon}")
+        if gap < 0:
+            raise ValueError(f"gap must be >= 0, got {gap}")
+        self.n_splits = n_splits
+        self.horizon = horizon
+        self.gap = gap
+
+    def split(self, X, y=None, groups=None) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+        n = len(X) if hasattr(X, "__len__") else X.shape[0]
+        # Same fold geometry as sklearn's TimeSeriesSplit (default test_size).
+        # With n_splits=k, the test folds occupy the last k * test_size rows.
+        test_size = n // (self.n_splits + 1)
+        if test_size < 1:
+            raise ValueError(
+                f"Too few samples ({n}) for n_splits={self.n_splits}"
+            )
+
+        indices = np.arange(n)
+        purge = max(self.horizon - 1, 0) + self.gap
+
+        for i in range(self.n_splits):
+            test_start = n - (self.n_splits - i) * test_size
+            test_end = test_start + test_size
+            train_end_purged = test_start - purge
+            if train_end_purged <= 0:
+                raise ValueError(
+                    f"Purge ({purge}) consumed entire training fold "
+                    f"(test_start={test_start}); reduce horizon, gap, or n_splits"
+                )
+            yield indices[:train_end_purged], indices[test_start:test_end]
+
+    def get_n_splits(self, X=None, y=None, groups=None) -> int:
+        return self.n_splits
+
+
+# ---------------------------------------------------------------------------
 # Walk-forward cross-validation
 # ---------------------------------------------------------------------------
 
@@ -133,8 +209,9 @@ def walk_forward_cv(
     step_size: int = 22,             # re-fit monthly
     refit: bool = True,
     rolling_window: Optional[int] = None,
+    horizon: int = 1,
 ) -> pd.DataFrame:
-    """Walk-forward cross-validation with optional rolling window.
+    """Walk-forward cross-validation with optional rolling window and purging.
 
     Parameters
     ----------
@@ -154,6 +231,11 @@ def walk_forward_cv(
         If set, use a rolling training window of this many rows instead
         of expanding from the start.  When None (default), the classic
         expanding-window scheme is used (backward-compatible).
+    horizon:
+        Label horizon in rows.  The last ``horizon - 1`` rows of each
+        training fold are purged so their forward-looking labels do not
+        overlap the test fold (López de Prado, AFML Ch. 7).  Default 1
+        disables purging — pass the active forecast horizon to enable it.
 
     Returns
     -------
@@ -166,6 +248,7 @@ def walk_forward_cv(
             f"Dataset too small ({n} rows) for initial_train_size={initial_train_size}"
         )
 
+    purge = max(horizon - 1, 0)
     records = []
     fold = 0
     train_end = initial_train_size
@@ -173,8 +256,17 @@ def walk_forward_cv(
     while train_end < n:
         test_end = min(train_end + step_size, n)
 
-        X_train = X.iloc[:train_end]
-        y_train = y.iloc[:train_end]
+        # Purge: drop the last (horizon - 1) rows of the training fold so
+        # their forward-looking labels don't overlap the test fold.
+        train_end_purged = train_end - purge
+        if train_end_purged <= 0:
+            raise ValueError(
+                f"Purge ({purge}) consumed entire training fold at "
+                f"train_end={train_end}; reduce horizon or grow initial_train_size"
+            )
+
+        X_train = X.iloc[:train_end_purged]
+        y_train = y.iloc[:train_end_purged]
         X_test = X.iloc[train_end:test_end]
         y_test = y.iloc[train_end:test_end]
 
@@ -194,8 +286,8 @@ def walk_forward_cv(
             records.append({"date": idx, "y_true": yt, "y_pred": yp, "fold": fold})
 
         logger.debug(
-            "Fold %d | train=%d  test=%d-%d",
-            fold, train_end, train_end, test_end,
+            "Fold %d | train=%d (purged=%d) test=%d-%d",
+            fold, train_end, train_end_purged, train_end, test_end,
         )
 
         train_end += step_size
@@ -239,7 +331,8 @@ def compare_models(
     for m in models:
         logger.info("Evaluating model: %s", m.name)
         cv = walk_forward_cv(m, X, y, initial_train_size=initial_train_size,
-                             step_size=step_size, rolling_window=rolling_window)
+                             step_size=step_size, rolling_window=rolling_window,
+                             horizon=horizon)
         metrics = compute_metrics(cv["y_true"], cv["y_pred"], name=m.name,
                                   horizon=horizon, periods_per_year=periods_per_year)
         metrics["model"] = m.name
@@ -278,7 +371,18 @@ def out_of_sample_backtest(
     n = len(X)
     split = n - holdout_size
 
-    model.fit(X.iloc[:split], y.iloc[:split])
+    # Purge: drop the last (horizon - 1) rows of the training set so their
+    # forward-looking labels do not overlap the holdout test set
+    # (López de Prado, AFML Ch. 7).
+    purge = max(horizon - 1, 0)
+    train_end = split - purge
+    if train_end <= 0:
+        raise ValueError(
+            f"Purge ({purge}) consumed entire training set (split={split}); "
+            f"reduce horizon or holdout_size"
+        )
+
+    model.fit(X.iloc[:train_end], y.iloc[:train_end])
     preds = model.predict(X.iloc[split:])
 
     oos = pd.DataFrame(
