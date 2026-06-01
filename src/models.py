@@ -7,6 +7,9 @@ Models
 ------
 NaiveModel           : Random-walk baseline (last observed value → 0 return)
 LinearModel          : Ridge regression benchmark
+ElasticNetModel      : Elastic-Net (L1+L2) regression with Optuna tuning —
+                       the p≫n workhorse for the short monthly sample
+CuratedForecaster    : Wrap any base model to train on a curated column subset
 XGBoostModel         : XGBoost regressor with Optuna hyper-parameter tuning
 LGBMModel            : LightGBM regressor with Optuna hyper-parameter tuning
 XGBoostClassifier    : XGBoost direction classifier (predict ±1)
@@ -22,7 +25,7 @@ from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import ElasticNet, Ridge
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -103,6 +106,159 @@ class LinearModel(BaseForecaster):
     @property
     def name(self) -> str:
         return "Linear (Ridge)"
+
+
+# ---------------------------------------------------------------------------
+# Elastic-Net (regularised linear; embedded feature selection)
+# ---------------------------------------------------------------------------
+
+
+class ElasticNetModel(BaseForecaster):
+    """Elastic-Net regression (L1 + L2) with standard scaling and Optuna tuning.
+
+    The honest workhorse when ``p >> n`` (e.g. ~140 features on ~430 monthly
+    rows): the L1 term zeroes redundant predictors (embedded selection) while
+    the L2 term keeps correlated groups stable.  Unlike :class:`LinearModel`
+    (Ridge, ``alpha`` fixed at 1.0), both the overall strength ``alpha`` and the
+    L1/L2 mix ``l1_ratio`` are tuned by walk-forward CV.
+    """
+
+    def __init__(
+        self,
+        alpha: float = 0.01,
+        l1_ratio: float = 0.5,
+        max_iter: int = 10000,
+    ) -> None:
+        self.alpha = alpha
+        self.l1_ratio = l1_ratio
+        self.max_iter = max_iter
+        self._pipe: Optional[Pipeline] = None
+
+    def _make_pipe(self, alpha: float, l1_ratio: float) -> Pipeline:
+        return Pipeline([
+            ("scaler", StandardScaler()),
+            ("enet", ElasticNet(alpha=alpha, l1_ratio=l1_ratio,
+                                max_iter=self.max_iter, random_state=42)),
+        ])
+
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> "ElasticNetModel":
+        self._pipe = self._make_pipe(self.alpha, self.l1_ratio)
+        self._pipe.fit(X, y)
+        return self
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        if self._pipe is None:
+            raise RuntimeError("Model not fitted yet.")
+        return self._pipe.predict(X)
+
+    def tune(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        n_trials: int = 50,
+        cv_splits: int = 5,
+        random_state: int = 42,
+        horizon: int = 1,
+    ) -> dict[str, Any]:
+        """Optuna search over ``alpha`` and ``l1_ratio`` (neg-RMSE, purged CV).
+
+        Uses :class:`PurgedTimeSeriesSplit` so each training fold drops its last
+        ``horizon - 1`` rows (label-overlap purge).  Sets ``self.alpha`` /
+        ``self.l1_ratio`` to the best found and returns them.
+        """
+        try:
+            import optuna
+            from sklearn.model_selection import cross_val_score
+        except ImportError as exc:
+            raise ImportError("optuna is required for tuning") from exc
+
+        from src.evaluation import PurgedTimeSeriesSplit
+
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        tscv = PurgedTimeSeriesSplit(n_splits=cv_splits, horizon=horizon)
+
+        def objective(trial: "optuna.Trial") -> float:
+            alpha = trial.suggest_float("alpha", 1e-3, 10.0, log=True)
+            l1_ratio = trial.suggest_float("l1_ratio", 0.1, 0.95)
+            scores = cross_val_score(
+                self._make_pipe(alpha, l1_ratio), X, y,
+                cv=tscv, scoring="neg_root_mean_squared_error",
+            )
+            return -scores.mean()
+
+        study = optuna.create_study(
+            direction="minimize",
+            sampler=optuna.samplers.TPESampler(seed=random_state))
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+        self.alpha = study.best_params["alpha"]
+        self.l1_ratio = study.best_params["l1_ratio"]
+        logger.info("ElasticNet best CV RMSE: %.6f | alpha=%.4g l1_ratio=%.3f",
+                    study.best_value, self.alpha, self.l1_ratio)
+        return {"alpha": self.alpha, "l1_ratio": self.l1_ratio}
+
+    @property
+    def coef_(self) -> np.ndarray:
+        """Fitted Elastic-Net coefficients (post-scaling). Raises if unfitted."""
+        if self._pipe is None:
+            raise RuntimeError("Model not fitted yet.")
+        return self._pipe.named_steps["enet"].coef_
+
+    @property
+    def name(self) -> str:
+        return "ElasticNet"
+
+
+# ---------------------------------------------------------------------------
+# Curated-feature wrapper (column subset → any base model)
+# ---------------------------------------------------------------------------
+
+
+class CuratedForecaster(BaseForecaster):
+    """Train/predict a base model on an economically-curated column subset.
+
+    A drop-in ``BaseForecaster`` so it works inside the shared-``X`` line-ups of
+    ``compare_models`` / ``out_of_sample_backtest`` while only seeing the curated
+    core (see :func:`src.feature_engineering.curate_features`).  The subset is
+    chosen from each ``fit`` call's columns, so walk-forward refits stay
+    leakage-safe.  Pairs naturally with :class:`ElasticNetModel` for the
+    ``p >> n`` monthly regime: ``CuratedForecaster(ElasticNetModel())``.
+    """
+
+    def __init__(
+        self,
+        base: BaseForecaster,
+        prefixes: Optional[tuple[str, ...]] = None,
+        keep_regime: bool = True,
+    ) -> None:
+        self.base = base
+        self.prefixes = prefixes
+        self.keep_regime = keep_regime
+        self._cols: Optional[list[str]] = None
+
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> "CuratedForecaster":
+        from src.feature_engineering import curate_features
+        self._cols = list(
+            curate_features(X, self.prefixes, self.keep_regime).columns)
+        self.base.fit(X[self._cols], y)
+        return self
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        if self._cols is None:
+            raise RuntimeError("Model not fitted yet.")
+        return self.base.predict(X[self._cols])
+
+    def tune(self, X: pd.DataFrame, y: pd.Series, **kwargs) -> Any:
+        """Curate first, then delegate tuning to the base model (if it tunes)."""
+        from src.feature_engineering import curate_features
+        self._cols = list(
+            curate_features(X, self.prefixes, self.keep_regime).columns)
+        if hasattr(self.base, "tune"):
+            return self.base.tune(X[self._cols], y, **kwargs)
+        return None
+
+    @property
+    def name(self) -> str:
+        return f"Curated({self.base.name})"
 
 
 # ---------------------------------------------------------------------------
