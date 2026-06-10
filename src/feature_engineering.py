@@ -41,6 +41,7 @@ Target
 from __future__ import annotations
 
 import logging
+import re
 from typing import Optional
 
 import numpy as np
@@ -54,6 +55,76 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_LAGS = [1, 5, 22]
 DEFAULT_HORIZONS = [1, 5, 22, 66]   # 1-day, 1-week, 1-month, 3-month ahead
+
+# Economically-motivated core feature set for the short monthly sample.  These
+# are *base-name prefixes* — matched against each column after its ``_lag_<n>``
+# suffix is stripped, so all lag variants of a kept concept come along.  Used by
+# :func:`curate_features` to fight the curse of dimensionality (≈140 columns on
+# ≈430 monthly rows) ahead of regularised-linear models.
+CURATED_PREFIXES = (
+    # Copper's own price dynamics
+    "copper_ret", "copper_vol", "copper_zscore",
+    # Physical balance — the strongest fundamental copper driver
+    "lme_copper_inv", "shfe_copper_inv", "chile_cu_exports",
+    # Macro / monetary backdrop
+    "real_yield", "infl_be", "indpro_yoy",
+    "china_pmi", "china_mfg",
+    # USD & cross-asset relative value
+    "dxy", "cny_usd", "gold_copper_ratio", "oil_copper_ratio",
+    "alu_copper_spread", "sp500_ret",
+    # Cointegration error-correction terms (mean-reversion signal)
+    "ect_",
+    # Seasonality
+    "month_sin", "month_cos",
+)
+
+
+def _strip_lag(col: str) -> str:
+    """Drop a trailing ``_lag_<n>`` suffix so the base concept can be matched."""
+    return re.sub(r"_lag_\d+$", "", col)
+
+
+def curate_features(
+    X: pd.DataFrame,
+    prefixes: Optional[tuple[str, ...]] = None,
+    keep_regime: bool = True,
+) -> pd.DataFrame:
+    """Subset a feature matrix to an economically-motivated core (+ lag variants).
+
+    Keeps a column when its lag-stripped base name starts with any entry in
+    ``prefixes`` (default :data:`CURATED_PREFIXES`).  Degrades gracefully — a
+    prefix that matches nothing is simply skipped — so it is safe across the
+    daily and monthly feature schemas.  Regime one-hot / label columns are
+    retained by default so regime-aware models keep working.
+
+    Parameters
+    ----------
+    X:
+        Feature matrix from :func:`split_features_targets`.
+    prefixes:
+        Base-name prefixes to keep.  None -> :data:`CURATED_PREFIXES`.
+    keep_regime:
+        Also keep ``regime`` / ``regime_<k>`` columns.
+
+    Returns
+    -------
+    pd.DataFrame
+        Column-subset of ``X`` (original column order preserved).  Falls back to
+        the full matrix with a warning if the curation would keep nothing.
+    """
+    pref = prefixes if prefixes is not None else CURATED_PREFIXES
+    keep = []
+    for c in X.columns:
+        base = _strip_lag(c)
+        if base.startswith(pref):
+            keep.append(c)
+        elif keep_regime and (base == "regime" or base.startswith("regime_")):
+            keep.append(c)
+    if not keep:
+        logger.warning("curate_features kept 0 columns — returning full matrix")
+        return X
+    logger.info("curate_features: kept %d/%d columns", len(keep), X.shape[1])
+    return X[keep]
 
 # Chinese New Year approximate dates (week of the holiday)
 # Extend as needed; the flag covers ±3 trading days around the date
@@ -250,6 +321,8 @@ def build_features(
     yoy_periods: int = 252,
     include_intraday: bool = True,
     horizon_unit: str = "d",
+    vol_normalise_targets: bool = False,
+    vol_target_window: Optional[int] = None,
 ) -> pd.DataFrame:
     """Construct the full feature matrix from the raw DataFrame.
 
@@ -287,6 +360,18 @@ def build_features(
     horizon_unit:
         Suffix used in target/feature column names. ``"d"`` (default) preserves
         the historical schema; the monthly notebook passes ``"m"``.
+    vol_normalise_targets:
+        When True, additionally emit ``target_retvol_{h}{u}`` columns: the
+        forward log-return divided by an *ex-ante* (trailing) volatility
+        estimate scaled to the horizon, ``sigma_t * sqrt(h)``.  The denominator
+        uses only returns up to ``t`` (no look-ahead), so it is in the
+        information set at forecast time.  Vol-scaling stabilises the target
+        variance across calm / turbulent regimes — better-conditioned loss for
+        GBMs and a cleaner Sharpe interpretation for the signal-led use case.
+        The original ``target_ret_{h}{u}`` columns are always kept.
+    vol_target_window:
+        Look-back window (rows) for the per-period volatility used in the
+        vol-normalised target.  Defaults to ``vol_windows[0]`` (or 22).
 
     Returns
     -------
@@ -413,9 +498,18 @@ def build_features(
     # Target variables (forward returns / prices) — built via concat
     # -----------------------------------------------------------------------
     target_series: dict[str, pd.Series] = {}
+    if vol_normalise_targets:
+        # Ex-ante per-period volatility (known at t): trailing std of 1-step
+        # log returns.  Scaled by sqrt(h) to approximate the h-step vol.
+        _vt_win = vol_target_window or (vol_windows[0] if vol_windows else 22)
+        _sigma1 = np.log(cp / cp.shift(1)).rolling(_vt_win).std()
     for h in horizons:
-        target_series[f"target_ret_{h}{u}"] = np.log(cp.shift(-h) / cp)
+        fwd_ret = np.log(cp.shift(-h) / cp)
+        target_series[f"target_ret_{h}{u}"] = fwd_ret
         target_series[f"target_price_{h}{u}"] = cp.shift(-h)
+        if vol_normalise_targets:
+            denom = (_sigma1 * np.sqrt(h)).replace(0, np.nan)
+            target_series[f"target_retvol_{h}{u}"] = fwd_ret / denom
     target_series["copper_price"] = cp
 
     target_df = pd.concat(target_series, axis=1)
@@ -431,6 +525,7 @@ def split_features_targets(
     horizon: int = 22,
     drop_nan: bool = True,
     horizon_unit: str = "d",
+    target_kind: str = "ret",
 ) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
     """Separate features, target return series, and target price series.
 
@@ -442,17 +537,28 @@ def split_features_targets(
         Forecast horizon to use as the target.
     drop_nan:
         If True, drop rows where any feature or target is NaN.
+    target_kind:
+        ``"ret"`` (default) returns the raw forward log-return target
+        ``target_ret_{h}{u}``.  ``"retvol"`` returns the vol-normalised target
+        ``target_retvol_{h}{u}`` (requires ``build_features(...,
+        vol_normalise_targets=True)``).  ``y_price`` is unchanged either way.
 
     Returns
     -------
     X : pd.DataFrame
         Feature matrix (excludes target columns and raw price).
     y_ret : pd.Series
-        Forward log-return target.
+        Forward (optionally vol-normalised) return target.
     y_price : pd.Series
         Forward price target.
     """
-    target_ret_col = f"target_ret_{horizon}{horizon_unit}"
+    if target_kind not in {"ret", "retvol"}:
+        raise ValueError(f"target_kind must be 'ret' or 'retvol', got {target_kind!r}")
+    target_ret_col = f"target_{target_kind}_{horizon}{horizon_unit}"
+    if target_ret_col not in feats.columns:
+        raise KeyError(
+            f"{target_ret_col!r} not found — pass vol_normalise_targets=True to "
+            f"build_features when target_kind='retvol'")
     target_price_col = f"target_price_{horizon}{horizon_unit}"
 
     # Exclude all target columns and raw copper_price from features
