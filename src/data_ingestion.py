@@ -821,6 +821,219 @@ def fetch_metal_inventory(
     return out
 
 
+# COMEX copper futures month codes (Yahoo Finance contract symbols, e.g. HGZ25.CMX).
+_COMEX_MONTH_CODES = {1: "F", 2: "G", 3: "H", 4: "J", 5: "K", 6: "M",
+                      7: "N", 8: "Q", 9: "U", 10: "V", 11: "X", 12: "Z"}
+
+
+def _comex_copper_symbol(year: int, month: int) -> str:
+    """Yahoo Finance symbol for the COMEX copper (HG) contract of a delivery month."""
+    return f"HG{_COMEX_MONTH_CODES[month]}{year % 100:02d}.CMX"
+
+
+def _assemble_curve_basis(contracts: dict, tenor_months: int = 3) -> pd.DataFrame:
+    """Build a front-vs-deferred copper basis from individual futures contracts.
+
+    Pure (network-free) assembly logic.  For each date it picks the nearest
+    not-yet-in-delivery contract (the *front*) and the nearest contract at least
+    ``tenor_months`` further out (the *deferred*), both quoted on that date, and
+    forms the curve-implied carry.
+
+    Parameters
+    ----------
+    contracts:
+        Mapping ``(year, month) -> pd.Series`` of close prices ($/lb) indexed by
+        date, one entry per delivery month.
+    tenor_months:
+        Target tenor of the deferred leg (~3 months for a cash-to-3M proxy).
+
+    Returns
+    -------
+    DataFrame with ``copper_cash_3m_spread`` ($/tonne) and ``copper_basis_pct``
+    (``deferred/front - 1``), indexed by date.  Empty if no date carries both a
+    front and a deferred quote.
+    """
+    deliveries = sorted(contracts.keys())
+    empty = pd.DataFrame(columns=["copper_cash_3m_spread", "copper_basis_pct"])
+    if not deliveries:
+        return empty
+    wide = pd.DataFrame({d: contracts[d] for d in deliveries}).sort_index()
+    deliv_start = {d: pd.Timestamp(d[0], d[1], 1) for d in deliveries}
+
+    rows = {}
+    for ts, row in wide.iterrows():
+        avail = [d for d in deliveries if pd.notna(row[d]) and deliv_start[d] > ts]
+        if not avail:
+            continue
+        front = avail[0]                                    # nearest unexpired
+        target = deliv_start[front] + pd.DateOffset(months=tenor_months)
+        deferred = next((d for d in avail if deliv_start[d] >= target), None)
+        if deferred is None or deferred == front:
+            continue
+        pf, pdef = float(row[front]), float(row[deferred])
+        if pf <= 0:
+            continue
+        rows[ts] = ((pdef - pf) * 2204.62, pdef / pf - 1.0)   # $/lb -> $/t spread
+    if not rows:
+        return empty
+    out = pd.DataFrame.from_dict(
+        rows, orient="index", columns=["copper_cash_3m_spread", "copper_basis_pct"])
+    out.index = pd.DatetimeIndex(out.index).tz_localize(None)
+    return out.sort_index()
+
+
+def fetch_comex_copper_basis(
+    start: str = "2010-01-01",
+    end: Optional[str] = None,
+    tenor_months: int = 3,
+) -> pd.DataFrame:
+    """Real COMEX copper futures-curve basis (front vs ~3-month-deferred HG).
+
+    Assembles a genuine traded carry from individual COMEX copper contracts on
+    Yahoo Finance.  IMPORTANT: Yahoo serves only a shallow window of per-contract
+    history (often a few weeks per contract), so in practice this populates only
+    the recent period — callers fall back to a CSV or synthetic basis for the
+    deep historical backtest.  Returns an empty DataFrame on any failure.
+    """
+    if end is None:
+        end = date.today().isoformat()
+    try:
+        sy, ey = int(str(start)[:4]), int(str(end)[:4])
+    except Exception:
+        sy, ey = 2010, date.today().year
+    symbols = {}
+    for yr in range(sy, ey + 2):                 # +1y ahead for the live curve
+        for mo in range(1, 13):
+            symbols[_comex_copper_symbol(yr, mo)] = (yr, mo)
+    try:
+        raw = yf.download(list(symbols), start=start, end=end,
+                          auto_adjust=False, progress=False)
+    except Exception as exc:
+        logger.warning("COMEX copper curve download failed: %s", exc)
+        return pd.DataFrame(columns=["copper_cash_3m_spread", "copper_basis_pct"])
+    if raw is None or len(raw) == 0:
+        return pd.DataFrame(columns=["copper_cash_3m_spread", "copper_basis_pct"])
+    close = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw[["Close"]]
+    contracts = {}
+    for sym, deliv in symbols.items():
+        if sym in close.columns:
+            s = close[sym].dropna()
+            if len(s):
+                contracts[deliv] = s
+    basis = _assemble_curve_basis(contracts, tenor_months=tenor_months)
+    if len(basis):
+        basis = basis.loc[start:end]
+        logger.info("COMEX copper basis: %d dates assembled from %d contracts with data",
+                    len(basis), len(contracts))
+    return basis
+
+
+def fetch_lme_cash_3m(
+    start: str = "2010-01-01",
+    end: Optional[str] = None,
+    csv_path: Optional[str] = None,
+    try_comex: bool = True,
+    tenor_months: int = 3,
+) -> pd.DataFrame:
+    """LME copper cash-to-3-month term structure (the futures *basis*).
+
+    Returns two daily columns:
+      - ``copper_cash_3m_spread`` : 3-month minus cash price ($/tonne). Positive
+        => contango; negative => backwardation (physical tightness / low stocks).
+      - ``copper_basis_pct``      : that spread as a fraction of cash — the
+        curve's own implied return to the 3-month point, and the input to
+        :class:`src.models.FuturesBasisBenchmark`.
+
+    Resolution order (graceful degradation, matching the rest of this module):
+      1. ``csv_path`` — a user-supplied CSV with a date index and ``cash`` +
+         ``three_month`` (aliases ``spot`` / ``p3m`` / ``3m``) columns.  Use
+         this to drop in a real licensed LME feed.
+      2. COMEX futures-curve basis (``try_comex``) — a *real* traded carry from
+         individual COMEX copper (HG) contracts via :func:`fetch_comex_copper_basis`.
+         Yahoo serves only a shallow window of per-contract history, so this
+         usually populates the recent period only.
+      3. Synthetic AR(1) placeholder — a small mean-reverting basis so the
+         pipeline and the futures-basis benchmark run end-to-end offline.  It is
+         clearly logged as synthetic and must NOT drive live trading signals.
+
+    A genuine free deep-history copper cash-and-3-month curve is not publicly
+    available, so for the historical backtest this falls back to the synthetic
+    placeholder unless ``csv_path`` (a licensed feed) is supplied.
+
+    Parameters
+    ----------
+    start, end:
+        ISO date window.  ``end`` defaults to today.
+    csv_path:
+        Optional path to a real cash / 3-month CSV (see above).
+    try_comex:
+        If True (default), attempt the real COMEX futures-curve basis before the
+        synthetic fallback.  Set False to skip the network call (e.g. in tests).
+    tenor_months:
+        Deferred-leg tenor for the COMEX curve basis (~3 months).
+    """
+    import numpy as np
+
+    if end is None:
+        end = date.today().isoformat()
+
+    # 1) Real data drop-in -------------------------------------------------
+    if csv_path:
+        try:
+            raw = pd.read_csv(csv_path, parse_dates=[0], index_col=0).sort_index()
+            lc = {str(c).lower(): c for c in raw.columns}
+            cash_col = next((lc[k] for k in ("cash", "spot") if k in lc), None)
+            p3m_col = next((lc[k] for k in ("three_month", "p3m", "3m", "month3") if k in lc), None)
+            if cash_col is not None and p3m_col is not None:
+                cash = raw[cash_col].astype(float)
+                p3m = raw[p3m_col].astype(float)
+                out = pd.DataFrame({
+                    "copper_cash_3m_spread": p3m - cash,
+                    "copper_basis_pct": (p3m - cash) / cash,
+                })
+                out.index = pd.DatetimeIndex(out.index).tz_localize(None)
+                out = out.loc[start:end]
+                logger.info("LME cash-3M: loaded %d rows from %s", len(out), csv_path)
+                return out
+            logger.warning("LME cash-3M CSV %s lacks cash/three_month columns; "
+                           "falling back", csv_path)
+        except Exception as exc:
+            logger.warning("LME cash-3M CSV load failed (%s); falling back", exc)
+
+    # 2) Real COMEX futures-curve basis (front vs ~3-month-deferred HG) -----
+    if try_comex:
+        try:
+            comex = fetch_comex_copper_basis(start, end, tenor_months=tenor_months)
+            if comex is not None and int(comex["copper_basis_pct"].notna().sum()) >= 5:
+                logger.info("Copper basis: using real COMEX futures curve (%d dates)", len(comex))
+                return comex
+            logger.warning("COMEX copper basis unavailable/too shallow; falling back to synthetic")
+        except Exception as exc:
+            logger.warning("COMEX copper basis failed (%s); falling back to synthetic", exc)
+
+    # 3) Synthetic AR(1) placeholder --------------------------------------
+    logger.warning(
+        "Copper basis: no real feed available — generating a SYNTHETIC basis "
+        "(do NOT use for live signals). Pass csv_path / lme_basis_csv for real data."
+    )
+    idx = pd.bdate_range(start, end)
+    n = len(idx)
+    if n == 0:
+        return pd.DataFrame(columns=["copper_cash_3m_spread", "copper_basis_pct"])
+    rng = np.random.default_rng(20240601)
+    phi, mu, sigma = 0.97, 0.0, 0.004        # mean-reverting basis, ~0.4% std
+    b = np.empty(n)
+    b[0] = mu
+    eps = rng.standard_normal(n) * sigma * np.sqrt(1.0 - phi ** 2)
+    for t in range(1, n):
+        b[t] = mu + phi * (b[t - 1] - mu) + eps[t]
+    basis_pct = pd.Series(b, index=idx, name="copper_basis_pct")
+    spread = (basis_pct * 9000.0).rename("copper_cash_3m_spread")   # nominal $/t
+    out = pd.concat([spread, basis_pct], axis=1)
+    out.index = pd.DatetimeIndex(out.index).tz_localize(None)
+    return out
+
+
 def fetch_chile_copper_exports(
     start: str = "1990-01-01",
     end: Optional[str] = None,
@@ -900,6 +1113,8 @@ def load_data(
     include_lme_inventory: bool = False,
     include_shfe_inventory: bool = False,
     include_chile_supply: bool = False,
+    include_lme_basis: bool = False,
+    lme_basis_csv: Optional[str] = None,
     monthly_agg_overrides: Optional[dict[str, str]] = None,
 ) -> pd.DataFrame:
     """Fetch all data sources and return a single aligned DataFrame.
@@ -1002,6 +1217,19 @@ def load_data(
             logger.info("EIA data integrated: %d columns added", eia_aligned.shape[1])
     else:
         eia_df = pd.DataFrame()
+
+    # LME copper cash-to-3-month basis (futures term structure) — market data,
+    # so no publication lag; works for both daily and monthly output.
+    if include_lme_basis:
+        basis_df = fetch_lme_cash_3m(start=start, end=end, csv_path=lme_basis_csv)
+        if not basis_df.empty:
+            if freq == "M":
+                basis_aligned = _resample_to_month_end(basis_df, overrides=monthly_agg_overrides)
+                basis_aligned = basis_aligned.reindex(master_idx, method="ffill")
+            else:
+                basis_aligned = basis_df.reindex(master_idx, method="ffill")
+            df = pd.concat([df, basis_aligned], axis=1)
+            logger.info("LME cash-3M basis integrated: %d columns added", basis_aligned.shape[1])
 
     # COT positioning data (skipped for monthly — daily-only signal)
     if include_cot and freq == "B":

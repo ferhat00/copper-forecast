@@ -15,6 +15,16 @@ overlap_aware_sharpe : Signal Sharpe with HAC std-error / effective-N for
 deflated_sharpe_ratio : Probabilistic / Deflated Sharpe (Bailey & López de
                        Prado 2014) — discounts a Sharpe for selection bias
 diebold_mariano      : Equal-predictive-accuracy test vs a benchmark forecast
+clark_west           : MSPE-adjusted equal-accuracy test for NESTED models —
+                       the correct "does it beat the random walk?" test
+pesaran_timmermann   : Directional / sign-predictability test (market timing)
+model_confidence_set : Hansen-Lunde-Nason MCS over the whole model line-up
+white_reality_check  : White (2000) data-snooping test (1/N vs stacking governance)
+interval_metrics     : Coverage, width and interval score of prediction bands
+crps_gaussian        : Continuous Ranked Probability Score, Gaussian bands
+crps_from_quantiles  : CRPS from a quantile grid (twice integrated pinball)
+pinball_loss         : Quantile (pinball) loss for one quantile level
+subperiod_metrics    : Per-sub-period / per-regime metric breakdown
 select_best_model    : Robust, selection-bias-aware model picker (replaces
                        argmax of the pooled signal Sharpe)
 nested_cv_select     : Nested CV that grades the *selection procedure* on
@@ -408,6 +418,526 @@ def diebold_mariano(
 
 
 # ---------------------------------------------------------------------------
+# Nested-model accuracy, directional, density and Model-Confidence-Set tests
+# ---------------------------------------------------------------------------
+#
+# Diebold-Mariano (above) is the right test only for *non-nested* pairs.  The
+# headline question for copper — "does this model beat the random walk?" — is a
+# nested comparison (the RW forecast of zero log-return is nested inside every
+# model with predictors), where DM is over-sized and Clark-West is required.
+# These helpers add the nested test, a directional-skill test, calibrated-
+# interval / density scoring, and a Model Confidence Set for the whole line-up.
+
+
+def clark_west(
+    y_true: np.ndarray | pd.Series,
+    pred_model: np.ndarray | pd.Series,
+    pred_bench: Optional[np.ndarray | pd.Series] = None,
+    horizon: int = 1,
+) -> dict[str, float]:
+    """Clark-West (2007) MSPE-adjusted test of equal accuracy for NESTED models.
+
+    Diebold-Mariano is biased toward the larger model when the candidate nests
+    the benchmark — the usual case here, since the random-walk forecast (zero
+    log-return, ``pred_bench`` of zeros) is nested inside any model that adds
+    predictors.  Clark-West corrects the MSPE for the estimation noise the
+    larger model introduces, giving the correct "does this beat the random
+    walk out of sample?" test.
+
+    Per observation it forms
+    ``f = (y - yb)^2 - (y - ym)^2 + (yb - ym)^2``
+    (``yb`` = benchmark, ``ym`` = candidate), averages it and divides by a
+    Newey-West HAC standard error with lag ``horizon - 1`` (overlapping
+    multi-step forecasts).  The statistic is one-sided ~N(0, 1): a large
+    positive value rejects equal accuracy in favour of ``pred_model``.
+
+    Parameters
+    ----------
+    y_true, pred_model:
+        Observations and the (larger) candidate model's forecasts.
+    pred_bench:
+        Benchmark forecasts.  None -> zeros (random walk on log-returns).
+    horizon:
+        Forecast horizon in rows (sets the HAC lag).
+
+    Returns
+    -------
+    dict with keys: ``cw_stat`` (positive -> candidate beats benchmark),
+    ``p_value`` (one-sided H0: no improvement over benchmark), ``mean_f``,
+    ``n_obs``.
+    """
+    from scipy import stats
+
+    y = np.asarray(y_true, dtype=float)
+    ym = np.asarray(pred_model, dtype=float)
+    yb = np.zeros_like(y) if pred_bench is None else np.asarray(pred_bench, dtype=float)
+    mask = np.isfinite(y) & np.isfinite(ym) & np.isfinite(yb)
+    y, ym, yb = y[mask], ym[mask], yb[mask]
+    n = y.size
+    out = {"cw_stat": float("nan"), "p_value": float("nan"),
+           "mean_f": float("nan"), "n_obs": float(n)}
+    if n < 3:
+        return out
+
+    f = (y - yb) ** 2 - (y - ym) ** 2 + (yb - ym) ** 2
+    f_bar = float(f.mean())
+    out["mean_f"] = f_bar
+    lag = max(int(horizon) - 1, 0)
+    lrv = _newey_west_long_run_var(f, lag)         # = n * Var(f_bar)
+    if lrv <= 0:
+        # Degenerate (identical forecasts): no improvement to detect.
+        if f_bar == 0.0:
+            out.update(cw_stat=0.0, p_value=0.5)
+        return out
+    se = float(np.sqrt(lrv / n))
+    cw = f_bar / se
+    out.update(cw_stat=float(cw), p_value=float(stats.norm.sf(cw)))
+    return out
+
+
+def pesaran_timmermann(
+    y_true: np.ndarray | pd.Series,
+    y_pred: np.ndarray | pd.Series,
+) -> dict[str, float]:
+    """Pesaran-Timmermann (1992) test of directional / sign predictability.
+
+    Tests H0 that the signs of ``y_pred`` and ``y_true`` are independent (no
+    market-timing skill).  Complements the point ``directional_accuracy`` with a
+    significance level: at weekly/monthly horizons RMSE gains over the random
+    walk are tiny, yet *direction* may still be predictable — and that is what a
+    long/short copper signal monetises.  Observations with ``y_true == 0`` are
+    dropped.
+
+    Returns
+    -------
+    dict with keys: ``pt_stat`` (one-sided ~N(0, 1)), ``p_value`` (H0: no
+    directional skill), ``hit_rate`` (realised), ``expected_hit_rate`` (under
+    independence), ``n_obs``.
+    """
+    from scipy import stats
+
+    y = np.asarray(y_true, dtype=float)
+    p = np.asarray(y_pred, dtype=float)
+    mask = np.isfinite(y) & np.isfinite(p) & (y != 0)
+    y, p = y[mask], p[mask]
+    n = y.size
+    out = {"pt_stat": float("nan"), "p_value": float("nan"),
+           "hit_rate": float("nan"), "expected_hit_rate": float("nan"),
+           "n_obs": float(n)}
+    if n < 3:
+        return out
+
+    zy = (y > 0).astype(float)
+    zp = (p > 0).astype(float)
+    P = float(np.mean(zy == zp))                # realised success rate
+    py = float(zy.mean())
+    px = float(zp.mean())
+    Pstar = py * px + (1.0 - py) * (1.0 - px)   # expected under independence
+
+    var_P = Pstar * (1.0 - Pstar) / n
+    var_Pstar = (
+        ((2.0 * py - 1.0) ** 2) * px * (1.0 - px) / n
+        + ((2.0 * px - 1.0) ** 2) * py * (1.0 - py) / n
+        + 4.0 * py * px * (1.0 - py) * (1.0 - px) / (n ** 2)
+    )
+    denom = var_P - var_Pstar
+    if denom <= 0:
+        out.update(hit_rate=P, expected_hit_rate=Pstar)
+        return out
+    pt = (P - Pstar) / np.sqrt(denom)
+    out.update(pt_stat=float(pt), p_value=float(stats.norm.sf(pt)),
+               hit_rate=P, expected_hit_rate=Pstar)
+    return out
+
+
+def _block_bootstrap_indices(
+    n: int, block_len: int, n_boot: int, rng: np.random.Generator
+) -> np.ndarray:
+    """Circular block-bootstrap row indices: array of shape ``(n_boot, n)``.
+
+    Resamples contiguous blocks (wrapping around the end) so the serial
+    dependence induced by overlapping multi-step losses is preserved in each
+    bootstrap replicate — the same row indices are applied to every model so
+    cross-model dependence is preserved too.
+    """
+    block_len = max(1, min(int(block_len), n))
+    n_blocks = int(np.ceil(n / block_len))
+    starts = rng.integers(0, n, size=(n_boot, n_blocks))
+    offsets = np.arange(block_len)
+    out = np.empty((n_boot, n_blocks * block_len), dtype=int)
+    for b in range(n_boot):
+        out[b] = ((starts[b][:, None] + offsets[None, :]) % n).reshape(-1)
+    return out[:, :n]
+
+
+def model_confidence_set(
+    losses: pd.DataFrame,
+    alpha: float = 0.10,
+    n_boot: int = 1000,
+    block_len: Optional[int] = None,
+    random_state: int = 42,
+) -> dict:
+    """Model Confidence Set (Hansen, Lunde & Nason 2011) — range statistic T_R.
+
+    Given a matrix of per-period losses (one column per model), returns the set
+    of models that contains the best forecaster with probability ``1 - alpha``,
+    via a block-bootstrap test of equal predictive ability with sequential
+    elimination of the worst model.  This compares the *whole* line-up at once
+    (instead of many pairwise DM/CW tests) and reports which models are
+    statistically indistinguishable from the best.
+
+    Parameters
+    ----------
+    losses:
+        DataFrame ``(T x m)`` of per-observation losses (e.g. squared forecast
+        errors), columns labelled by model name.  Rows with any NaN are dropped.
+    alpha:
+        MCS level; the surviving set has confidence ``1 - alpha``.
+    n_boot:
+        Number of block-bootstrap resamples.
+    block_len:
+        Circular-block length for the dependent bootstrap.  None ->
+        ``max(1, round(sqrt(T)))`` (heuristic for overlapping multi-step losses).
+    random_state:
+        Seed for reproducibility.
+
+    Returns
+    -------
+    dict with keys: ``included`` (model names in the MCS), ``mcs_pvalues``
+    (pd.Series per model; ``>= alpha`` -> in set), ``eliminated_order``.
+    """
+    if not isinstance(losses, pd.DataFrame):
+        losses = pd.DataFrame(losses)
+    L = losses.dropna(axis=0, how="any")
+    names = list(L.columns)
+    m = len(names)
+    if m < 2:
+        return {"included": names,
+                "mcs_pvalues": pd.Series({n: 1.0 for n in names}, dtype=float),
+                "eliminated_order": []}
+
+    Lv = L.to_numpy(dtype=float)
+    T = Lv.shape[0]
+    if T < 3:
+        return {"included": names,
+                "mcs_pvalues": pd.Series({n: 1.0 for n in names}, dtype=float),
+                "eliminated_order": []}
+    if block_len is None:
+        block_len = max(1, int(round(np.sqrt(T))))
+    rng = np.random.default_rng(random_state)
+    boot_idx = _block_bootstrap_indices(T, block_len, n_boot, rng)
+
+    # Bootstrap column-mean losses (shared resample across models).
+    boot_means = np.stack([Lv[boot_idx[b]].mean(axis=0) for b in range(n_boot)], axis=0)
+    col_means = Lv.mean(axis=0)                    # (m,)
+
+    active = list(range(m))
+    mcs_p = {nme: float("nan") for nme in names}
+    eliminated_order: list[str] = []
+    running_p = 0.0
+
+    while len(active) > 1:
+        idx = np.array(active)
+        cm = col_means[idx]                        # (k,)
+        bm = boot_means[:, idx]                     # (n_boot, k)
+        k = idx.size
+
+        d_bar = cm[:, None] - cm[None, :]           # (k, k) pairwise mean loss diff
+        bd = bm[:, :, None] - bm[:, None, :]        # (n_boot, k, k) bootstrap d_bar
+        var_d = ((bd - d_bar[None, :, :]) ** 2).mean(axis=0)   # (k, k)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t_ij = np.where(var_d > 0, d_bar / np.sqrt(var_d), 0.0)
+            t_boot = np.where(var_d[None] > 0,
+                              (bd - d_bar[None]) / np.sqrt(var_d[None]), 0.0)
+
+        iu = np.triu_indices(k, k=1)
+        if iu[0].size:
+            TR = float(np.max(np.abs(t_ij[iu])))
+            TR_boot = np.max(np.abs(t_boot[:, iu[0], iu[1]]), axis=1)
+            p_val = float(np.mean(TR_boot > TR))
+        else:
+            p_val = 1.0
+
+        running_p = max(running_p, p_val)
+        if p_val > alpha:
+            for j in active:
+                if np.isnan(mcs_p[names[j]]):
+                    mcs_p[names[j]] = running_p if running_p > 0 else 1.0
+            break
+
+        # Eliminate the worst model: largest average standardized excess loss.
+        t_row = t_ij.mean(axis=1)                   # (k,)
+        worst_local = int(np.argmax(t_row))
+        worst_global = active[worst_local]
+        mcs_p[names[worst_global]] = running_p
+        eliminated_order.append(names[worst_global])
+        active.pop(worst_local)
+
+    for nme in names:                               # survivors / fallbacks -> 1.0
+        if np.isnan(mcs_p[nme]):
+            mcs_p[nme] = 1.0
+
+    mcs_pvalues = pd.Series(mcs_p, dtype=float)
+    included = [nme for nme in names if mcs_pvalues[nme] >= alpha]
+    return {"included": included, "mcs_pvalues": mcs_pvalues,
+            "eliminated_order": eliminated_order}
+
+
+def white_reality_check(
+    loss_benchmark: np.ndarray | pd.Series,
+    losses_models,
+    n_boot: int = 1000,
+    block_len: Optional[int] = None,
+    random_state: int = 42,
+) -> dict:
+    """White's (2000) Reality Check for data snooping.
+
+    Tests H0 that the BEST of several candidate models does NOT outperform the
+    benchmark, controlling for the fact that the best was *chosen* from many.
+    Use it as the governance check on forecast combination: feed the benchmark's
+    per-period loss (e.g. the 1/N equal-weight average, or the random walk) and
+    the per-period losses of the candidates (stacking, trimmed mean, individual
+    models); a p-value above your level means the apparent winner's edge is not
+    distinguishable from luck-of-the-search.
+
+    Parameters
+    ----------
+    loss_benchmark:
+        Per-period loss of the benchmark, length ``T``.
+    losses_models:
+        ``(T x K)`` per-period losses of the candidate models.
+    n_boot, block_len, random_state:
+        Stationary (circular block) bootstrap settings; ``block_len`` defaults to
+        ``max(1, round(sqrt(T)))``.
+
+    Returns
+    -------
+    dict: ``reality_check_stat``, ``p_value`` (H0: no model beats the benchmark),
+    ``best_model`` (column index), ``n_models``.
+    """
+    Lb = np.asarray(loss_benchmark, dtype=float)
+    M = np.asarray(losses_models, dtype=float)
+    if M.ndim == 1:
+        M = M.reshape(-1, 1)
+    mask = np.isfinite(Lb) & np.isfinite(M).all(axis=1)
+    Lb, M = Lb[mask], M[mask]
+    T, K = M.shape
+    out = {"reality_check_stat": float("nan"), "p_value": float("nan"),
+           "best_model": -1, "n_models": K}
+    if T < 3 or K == 0:
+        return out
+
+    d = Lb[:, None] - M                              # >0 => model beats benchmark
+    dbar = d.mean(axis=0)
+    V = float(np.sqrt(T) * dbar.max())
+    if block_len is None:
+        block_len = max(1, int(round(np.sqrt(T))))
+    rng = np.random.default_rng(random_state)
+    idx = _block_bootstrap_indices(T, block_len, n_boot, rng)
+    Vb = np.empty(n_boot)
+    for b in range(n_boot):
+        db = d[idx[b]].mean(axis=0) - dbar           # recentered under the null
+        Vb[b] = np.sqrt(T) * db.max()
+    out.update(reality_check_stat=V, p_value=float(np.mean(Vb > V)),
+               best_model=int(dbar.argmax()))
+    return out
+
+
+def pinball_loss(
+    y_true: np.ndarray | pd.Series,
+    q_pred: np.ndarray | pd.Series,
+    quantile: float,
+) -> float:
+    """Mean pinball (quantile) loss at one quantile level (lower = better)."""
+    y = np.asarray(y_true, dtype=float)
+    q = np.asarray(q_pred, dtype=float)
+    mask = np.isfinite(y) & np.isfinite(q)
+    y, q = y[mask], q[mask]
+    if y.size == 0:
+        return float("nan")
+    e = y - q
+    return float(np.mean(np.maximum(quantile * e, (quantile - 1.0) * e)))
+
+
+def crps_gaussian(
+    y_true: np.ndarray | pd.Series,
+    mu: np.ndarray | pd.Series,
+    sigma: np.ndarray | pd.Series,
+) -> float:
+    """Mean Continuous Ranked Probability Score for Gaussian predictive bands.
+
+    Closed form ``CRPS = sigma * [ z(2*Phi(z) - 1) + 2*phi(z) - 1/sqrt(pi) ]``
+    with ``z = (y - mu)/sigma`` (Gneiting & Raftery 2007).  A proper scoring
+    rule for the *whole* predictive density — use it to grade ARIMAX / state-
+    space Gaussian intervals (lower = better).
+    """
+    from scipy import stats
+
+    y = np.asarray(y_true, dtype=float)
+    mu = np.asarray(mu, dtype=float)
+    sig = np.asarray(sigma, dtype=float)
+    mask = np.isfinite(y) & np.isfinite(mu) & np.isfinite(sig) & (sig > 0)
+    y, mu, sig = y[mask], mu[mask], sig[mask]
+    if y.size == 0:
+        return float("nan")
+    z = (y - mu) / sig
+    crps = sig * (z * (2.0 * stats.norm.cdf(z) - 1.0)
+                  + 2.0 * stats.norm.pdf(z) - 1.0 / np.sqrt(np.pi))
+    return float(np.mean(crps))
+
+
+def crps_from_quantiles(
+    y_true: np.ndarray | pd.Series,
+    quantile_preds: np.ndarray,
+    quantile_levels: np.ndarray | list,
+) -> float:
+    """Approximate mean CRPS from a quantile grid (twice integrated pinball).
+
+    Uses ``CRPS = 2 * integral_0^1 PB_tau d_tau`` (Gneiting & Raftery 2007),
+    approximated by the trapezoidal rule over the supplied quantile levels.
+    Grades distribution-free quantile forecasters (e.g. ``QuantileForecaster``,
+    quantile regression) on density accuracy, not just the point.
+
+    Parameters
+    ----------
+    y_true:
+        Observations, length ``T``.
+    quantile_preds:
+        Array ``(T x Q)`` of quantile forecasts aligned with ``quantile_levels``.
+    quantile_levels:
+        The ``Q`` quantile levels in (0, 1).
+    """
+    y = np.asarray(y_true, dtype=float)
+    Q = np.asarray(quantile_preds, dtype=float)
+    taus = np.asarray(quantile_levels, dtype=float)
+    if Q.ndim == 1:
+        Q = Q.reshape(-1, 1)
+    order = np.argsort(taus)
+    taus = taus[order]
+    Q = Q[:, order]
+    qs = np.array([pinball_loss(y, Q[:, k], float(taus[k])) for k in range(taus.size)])
+    if taus.size == 1:
+        return float(2.0 * qs[0])
+    # Trapezoidal integral over tau (manual, to avoid np.trapz deprecation).
+    integral = float(np.sum(0.5 * (qs[1:] + qs[:-1]) * np.diff(taus)))
+    return float(2.0 * integral)
+
+
+def interval_metrics(
+    y_true: np.ndarray | pd.Series,
+    lower: np.ndarray | pd.Series,
+    upper: np.ndarray | pd.Series,
+    coverage_level: float = 0.80,
+) -> dict[str, float]:
+    """Empirical coverage, width and interval score of prediction intervals.
+
+    Grades the *calibration* of a model's ``predict_interval`` output (e.g.
+    ``QuantileForecaster``, ARIMAX Gaussian bands).  The interval score
+    (Gneiting & Raftery 2007) rewards narrow intervals but penalises misses and
+    is the proper scoring rule for a central prediction interval (lower = better).
+
+    Parameters
+    ----------
+    y_true, lower, upper:
+        Observations and the interval bounds.
+    coverage_level:
+        Nominal central coverage of the interval (e.g. 0.80 for an 80% band).
+
+    Returns
+    -------
+    dict: ``coverage`` (empirical), ``nominal`` (=coverage_level),
+    ``coverage_error`` (empirical - nominal), ``mean_width``, ``interval_score``,
+    ``n_obs``.
+    """
+    y = np.asarray(y_true, dtype=float)
+    lo = np.asarray(lower, dtype=float)
+    hi = np.asarray(upper, dtype=float)
+    mask = np.isfinite(y) & np.isfinite(lo) & np.isfinite(hi)
+    y, lo, hi = y[mask], lo[mask], hi[mask]
+    n = y.size
+    out = {"coverage": float("nan"), "nominal": float(coverage_level),
+           "coverage_error": float("nan"), "mean_width": float("nan"),
+           "interval_score": float("nan"), "n_obs": float(n)}
+    if n == 0:
+        return out
+    a = 1.0 - coverage_level                       # total tail probability
+    width = hi - lo
+    below = (y < lo).astype(float)
+    above = (y > hi).astype(float)
+    score = width + (2.0 / a) * (lo - y) * below + (2.0 / a) * (y - hi) * above
+    cov = float(np.mean((y >= lo) & (y <= hi)))
+    out.update(coverage=cov, coverage_error=cov - coverage_level,
+               mean_width=float(np.mean(width)), interval_score=float(np.mean(score)),
+               n_obs=float(n))
+    return out
+
+
+def subperiod_metrics(
+    result: pd.DataFrame,
+    horizon: int = 22,
+    periods_per_year: int = 252,
+    by="year",
+) -> pd.DataFrame:
+    """Break a pooled walk-forward / OOS result into per-sub-period metrics.
+
+    Apparent copper forecast skill is often confined to one volatile episode
+    (e.g. 2008), so a single pooled number hides as much as it shows.  This
+    splits a result with ``y_true``/``y_pred`` columns and a DatetimeIndex by
+    calendar period or by a supplied regime label, reporting per-bucket metrics
+    plus the Clark-West p-value versus the random walk.
+
+    Parameters
+    ----------
+    result:
+        DataFrame with columns ``y_true``, ``y_pred`` and a DatetimeIndex.
+    horizon, periods_per_year:
+        Passed to :func:`compute_metrics` / :func:`clark_west`.
+    by:
+        ``"year"`` / ``"quarter"`` / ``"month"`` to bucket by calendar period,
+        or a pd.Series (aligned by index — e.g. HMM regime labels) to bucket by
+        regime.
+
+    Returns
+    -------
+    DataFrame indexed by sub-period with the usual metric columns plus
+    ``cw_stat_vs_naive`` / ``cw_pvalue_vs_naive`` and the bucket size ``n``.
+    """
+    df = result[["y_true", "y_pred"]].copy()
+    if isinstance(by, pd.Series):
+        grp_key = by.reindex(df.index).to_numpy()
+        gname = by.name or "group"
+    else:
+        idx = pd.DatetimeIndex(df.index)
+        if by == "year":
+            grp_key = idx.year
+        elif by == "quarter":
+            grp_key = idx.to_period("Q").astype(str)
+        elif by == "month":
+            grp_key = idx.to_period("M").astype(str)
+        else:
+            raise ValueError(f"unknown 'by'={by!r} (use 'year'/'quarter'/'month' or a Series)")
+        gname = str(by)
+    df["_grp"] = np.asarray(grp_key)
+
+    rows = []
+    for g, sub in df.groupby("_grp"):
+        if len(sub) == 0:
+            continue
+        mt = compute_metrics(sub["y_true"], sub["y_pred"],
+                             horizon=horizon, periods_per_year=periods_per_year)
+        cw = clark_west(sub["y_true"].to_numpy(float), sub["y_pred"].to_numpy(float),
+                        horizon=horizon)
+        mt[gname] = g
+        mt["n"] = int(len(sub))
+        mt["cw_stat_vs_naive"] = cw["cw_stat"]
+        mt["cw_pvalue_vs_naive"] = cw["p_value"]
+        rows.append(mt)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).set_index(gname)
+
+
+# ---------------------------------------------------------------------------
 # Purged time-series splitter (López de Prado, AFML Ch. 7)
 # ---------------------------------------------------------------------------
 
@@ -600,6 +1130,7 @@ def compare_models(
     rolling_window: Optional[int] = None,
     periods_per_year: int = 252,
     return_folds: bool = False,
+    mcs_alpha: float = 0.10,
 ):
     """Run several models through walk-forward CV and tabulate metrics.
 
@@ -652,6 +1183,8 @@ def compare_models(
         dsr = deflated_sharpe_ratio(sig, n_trials=n_trials,
                                     effective_n=oa["effective_n"], horizon=horizon)
         dm = diebold_mariano(yt, yp, pred2=None, horizon=horizon, loss="squared")
+        cw = clark_west(yt, yp, horizon=horizon)            # nested vs random walk
+        pt = pesaran_timmermann(yt, yp)                     # directional skill
         fold_mt = _per_fold_metrics(cv, horizon, periods_per_year)
 
         metrics["signal_sharpe_tstat"] = oa["sharpe_tstat"]
@@ -662,6 +1195,10 @@ def compare_models(
         metrics["deflated_sharpe"] = dsr["deflated_sr"]
         metrics["dm_stat_vs_naive"] = dm["dm_stat"]
         metrics["dm_pvalue_vs_naive"] = dm["p_value"]
+        metrics["cw_stat_vs_naive"] = cw["cw_stat"]
+        metrics["cw_pvalue_vs_naive"] = cw["p_value"]
+        metrics["pt_stat"] = pt["pt_stat"]
+        metrics["pt_pvalue"] = pt["p_value"]
         metrics["n_folds"] = int(fold_mt["fold"].nunique()) if len(fold_mt) else 0
         metrics["signal_sharpe_fold_median"] = (
             float(fold_mt["signal_sharpe"].median()) if len(fold_mt) else float("nan"))
@@ -676,6 +1213,21 @@ def compare_models(
             fold_frames.append(fold_mt)
 
     summary = pd.DataFrame(rows).set_index("model")
+
+    # Model Confidence Set across the whole line-up (Hansen-Lunde-Nason).  The
+    # squared-error loss series share the walk-forward geometry (same X, y, fold
+    # layout), so they align by date.  Purely diagnostic — never break summary.
+    try:
+        if len(cv_results) >= 2:
+            losses = pd.DataFrame(
+                {name: (cv["y_true"] - cv["y_pred"]) ** 2
+                 for name, cv in cv_results.items()})
+            mcs = model_confidence_set(losses, alpha=mcs_alpha)
+            summary["mcs_pvalue"] = mcs["mcs_pvalues"].reindex(summary.index)
+            summary["in_mcs"] = summary.index.isin(mcs["included"])
+    except Exception as exc:  # pragma: no cover - diagnostic safety net
+        logger.warning("Model Confidence Set computation failed: %s", exc)
+
     if return_folds:
         fold_metrics = (pd.concat(fold_frames, ignore_index=True)
                         if fold_frames else pd.DataFrame())
@@ -749,6 +1301,8 @@ def out_of_sample_backtest(
     dsr = deflated_sharpe_ratio(sig, n_trials=max(n_trials, 1),
                                 effective_n=oa["effective_n"], horizon=horizon)
     dm = diebold_mariano(yt, yp, pred2=None, horizon=horizon, loss="squared")
+    cw = clark_west(yt, yp, horizon=horizon)
+    pt = pesaran_timmermann(yt, yp)
     metrics["signal_sharpe_tstat"] = oa["sharpe_tstat"]
     metrics["signal_sharpe_pvalue"] = oa["p_value"]
     metrics["signal_sharpe_ci_low"] = oa["sharpe_ci_low"]
@@ -757,6 +1311,10 @@ def out_of_sample_backtest(
     metrics["deflated_sharpe"] = dsr["deflated_sr"]
     metrics["dm_stat_vs_naive"] = dm["dm_stat"]
     metrics["dm_pvalue_vs_naive"] = dm["p_value"]
+    metrics["cw_stat_vs_naive"] = cw["cw_stat"]
+    metrics["cw_pvalue_vs_naive"] = cw["p_value"]
+    metrics["pt_stat"] = pt["pt_stat"]
+    metrics["pt_pvalue"] = pt["p_value"]
     return oos, metrics
 
 
@@ -998,6 +1556,8 @@ def nested_cv_select(
     dsr = deflated_sharpe_ratio(sig, n_trials=len(model_factories),
                                 effective_n=oa["effective_n"], horizon=horizon)
     dm = diebold_mariano(yt, yp, pred2=None, horizon=horizon, loss="squared")
+    cw = clark_west(yt, yp, horizon=horizon)
+    pt = pesaran_timmermann(yt, yp)
     pooled.update(
         signal_sharpe_ci_low=oa["sharpe_ci_low"],
         signal_sharpe_ci_high=oa["sharpe_ci_high"],
@@ -1006,6 +1566,10 @@ def nested_cv_select(
         deflated_sharpe=dsr["deflated_sr"],
         dm_stat_vs_naive=dm["dm_stat"],
         dm_pvalue_vs_naive=dm["p_value"],
+        cw_stat_vs_naive=cw["cw_stat"],
+        cw_pvalue_vs_naive=cw["p_value"],
+        pt_stat=pt["pt_stat"],
+        pt_pvalue=pt["p_value"],
     )
     return {
         "chosen_per_fold": chosen_per_fold,
