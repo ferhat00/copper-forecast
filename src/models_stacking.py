@@ -74,6 +74,7 @@ class StackingEnsemble(BaseForecaster):
           4. Refit all base models on the full training set.
         """
         oof_frames: dict[str, pd.Series] = {}
+        oof_failures: dict[str, str] = {}
 
         # Step 1: generate OOF predictions for each base model
         for model in self.base_models:
@@ -91,11 +92,15 @@ class StackingEnsemble(BaseForecaster):
                     model.name, len(cv_df),
                 )
             except Exception as exc:
+                oof_failures[model.name] = str(exc)
                 logger.warning("Stacking OOF: %s failed — %s", model.name, exc)
 
         if len(oof_frames) < 2:
+            reasons = "; ".join(f"{k}: {v}" for k, v in oof_failures.items())
             raise ValueError(
-                f"Need at least 2 base models with OOF predictions, got {len(oof_frames)}"
+                f"Need at least 2 base models with OOF predictions, got "
+                f"{len(oof_frames)} (n={len(X)}, oof_initial_size={self.oof_initial_size}). "
+                f"Base-model OOF failures — {reasons or 'none recorded'}"
             )
 
         # Step 2: align by common index
