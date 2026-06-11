@@ -6,10 +6,19 @@ Model definitions, training helpers, and ensemble utilities.
 Models
 ------
 NaiveModel           : Random-walk baseline (last observed value → 0 return)
+FuturesBasisBenchmark: Cost-of-carry benchmark — curve-implied return from the
+                       LME cash-3M basis (stricter than RW when the curve steep)
 LinearModel          : Ridge regression benchmark
 ElasticNetModel      : Elastic-Net (L1+L2) regression with Optuna tuning —
                        the p≫n workhorse for the short monthly sample
+AdaptiveLassoModel   : Adaptive LASSO (Zou 2006, oracle property) — consistent,
+                       sparse, signed feature selection for the monthly model
 CuratedForecaster    : Wrap any base model to train on a curated column subset
+
+Functions
+---------
+selection_stability_report : Cross-fold selection frequency / sign stability of
+                       a sparse linear model (AdaptiveLasso / ElasticNet)
 XGBoostModel         : XGBoost regressor with Optuna hyper-parameter tuning
 LGBMModel            : LightGBM regressor with Optuna hyper-parameter tuning
 XGBoostClassifier    : XGBoost direction classifier (predict ±1)
@@ -25,7 +34,7 @@ from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import ElasticNet, Ridge
+from sklearn.linear_model import ElasticNet, Lasso, Ridge
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -76,6 +85,74 @@ class NaiveModel(BaseForecaster):
     @property
     def name(self) -> str:
         return "Naive (RW)"
+
+
+# ---------------------------------------------------------------------------
+# Futures-basis (cost-of-carry) benchmark
+# ---------------------------------------------------------------------------
+
+
+class FuturesBasisBenchmark(BaseForecaster):
+    """Forecast the h-step return from the copper futures curve (the basis).
+
+    Under cost-of-carry / "the futures price is the market's expected future
+    spot", the cash-to-3-month basis *is* a forecast: a contango of +1% (3-month
+    above cash) implies the spot is expected to rise ~1% over three months.
+    This model linearly interpolates that curve-implied return to the forecast
+    horizon,
+
+        ``return_h = basis_pct * horizon / tenor_periods``
+
+    making it a fully transparent, traded-price benchmark that is *stricter*
+    than the random walk whenever the curve is steep (the literature's second
+    benchmark after the RW; see Reeve & Vigfusson 2011, Chinn & Coibion 2014).
+
+    It reads the basis from one feature column (default ``copper_basis_pct``
+    from :func:`src.data_ingestion.fetch_lme_cash_3m`).  If that column is absent
+    it degrades gracefully to the random walk (zeros), so it stays drop-in
+    compatible with the shared-``X`` line-ups in ``compare_models``.
+
+    Parameters
+    ----------
+    horizon:
+        Forecast horizon in the data's own period unit (e.g. 22 trading days for
+        the daily model, 1 month for the monthly model).
+    tenor_periods:
+        Periods spanning the basis tenor (≈ 63 trading days ~ 3 months for daily
+        data; 3 for monthly data).
+    basis_col:
+        Name of the fractional curve-implied-return column.
+    """
+
+    def __init__(
+        self,
+        horizon: int = 22,
+        tenor_periods: int = 63,
+        basis_col: str = "copper_basis_pct",
+    ) -> None:
+        self.horizon = horizon
+        self.tenor_periods = max(int(tenor_periods), 1)
+        self.basis_col = basis_col
+        self._warned = False
+
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> "FuturesBasisBenchmark":
+        return self
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        if self.basis_col not in X.columns:
+            if not self._warned:
+                logger.warning(
+                    "FuturesBasisBenchmark: column '%s' not found — falling back "
+                    "to random walk (zeros).", self.basis_col)
+                self._warned = True
+            return np.zeros(len(X))
+        basis = X[self.basis_col].to_numpy(dtype=float)
+        preds = basis * (self.horizon / self.tenor_periods)
+        return np.nan_to_num(preds, nan=0.0)
+
+    @property
+    def name(self) -> str:
+        return "Futures-Basis (carry)"
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +283,205 @@ class ElasticNetModel(BaseForecaster):
     @property
     def name(self) -> str:
         return "ElasticNet"
+
+
+# ---------------------------------------------------------------------------
+# Adaptive LASSO (oracle-property sparse linear; consistent selection)
+# ---------------------------------------------------------------------------
+
+
+class AdaptiveLassoModel(BaseForecaster):
+    """Adaptive LASSO (Zou 2006) — sparse linear model with the oracle property.
+
+    Plain LASSO over-shrinks large true coefficients and its selection is not
+    consistent when predictors are correlated (the LME/COMEX/DXY/CNY block).
+    The adaptive LASSO fixes this by penalising each coefficient by a data-driven
+    weight ``w_j = 1/|beta_init_j|^gamma`` from a first-stage root-n-consistent
+    fit (here ridge, robust when ``p >> n``): predictors the first stage finds
+    irrelevant are penalised hard (shrunk to exactly zero) while strong ones are
+    barely penalised — giving consistent variable selection and asymptotically
+    unbiased estimates, i.e. a transparent, signed, sparse equation to read off.
+
+    Implemented by the standard reparametrisation ``z_j = x_j * |beta_init_j|^gamma``
+    (a plain LASSO on the rescaled design), then mapping coefficients back.  The
+    honest companion to :class:`ElasticNetModel`: prefer the elastic net when
+    correlated predictors should stay grouped, the adaptive LASSO when you want
+    the sparsest defensible feature set and consistent selection.
+
+    Parameters
+    ----------
+    alpha:
+        LASSO penalty strength on the rescaled design.
+    gamma:
+        Adaptive-weight exponent (``> 0``; 1.0 is the common default).
+    ridge_alpha:
+        L2 strength of the first-stage ridge that forms the weights.
+    max_iter:
+        LASSO solver iterations.
+    """
+
+    def __init__(
+        self,
+        alpha: float = 0.01,
+        gamma: float = 1.0,
+        ridge_alpha: float = 1.0,
+        max_iter: int = 10000,
+    ) -> None:
+        self.alpha = alpha
+        self.gamma = gamma
+        self.ridge_alpha = ridge_alpha
+        self.max_iter = max_iter
+        self._scaler: Optional[StandardScaler] = None
+        self._lasso: Optional[Lasso] = None
+        self._a: Optional[np.ndarray] = None       # |beta_init|^gamma per column
+        self._cols: Optional[list[str]] = None
+
+    def _fit_arrays(self, X: pd.DataFrame, y: pd.Series, alpha: float, gamma: float):
+        scaler = StandardScaler()
+        Xs = scaler.fit_transform(X)
+        # First-stage ridge -> initial coefficients (root-n consistent, p>>n safe).
+        ridge = Ridge(alpha=self.ridge_alpha)
+        ridge.fit(Xs, y)
+        a = np.abs(ridge.coef_) ** gamma            # = 1 / w_j  (adaptive rescale)
+        Z = Xs * a                                   # rescaled design
+        lasso = Lasso(alpha=alpha, max_iter=self.max_iter, random_state=42)
+        lasso.fit(Z, y)
+        return scaler, lasso, a
+
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> "AdaptiveLassoModel":
+        self._cols = list(X.columns)
+        self._scaler, self._lasso, self._a = self._fit_arrays(
+            X, y, self.alpha, self.gamma)
+        return self
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        if self._lasso is None or self._scaler is None:
+            raise RuntimeError("Model not fitted yet.")
+        Z = self._scaler.transform(X) * self._a
+        return self._lasso.predict(Z)
+
+    def tune(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        n_trials: int = 50,
+        cv_splits: int = 5,
+        random_state: int = 42,
+        horizon: int = 1,
+    ) -> dict[str, Any]:
+        """Optuna search over ``alpha`` and ``gamma`` (neg-RMSE, purged CV).
+
+        Uses :class:`PurgedTimeSeriesSplit` so each training fold drops its last
+        ``horizon - 1`` rows (label-overlap purge).  Sets ``self.alpha`` /
+        ``self.gamma`` to the best found and returns them.
+        """
+        try:
+            import optuna
+        except ImportError as exc:
+            raise ImportError("optuna is required for tuning") from exc
+        from sklearn.metrics import mean_squared_error
+
+        from src.evaluation import PurgedTimeSeriesSplit
+
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        tscv = PurgedTimeSeriesSplit(n_splits=cv_splits, horizon=horizon)
+        Xv = X.reset_index(drop=True)
+        yv = pd.Series(np.asarray(y, dtype=float))
+
+        def objective(trial: "optuna.Trial") -> float:
+            alpha = trial.suggest_float("alpha", 1e-4, 1.0, log=True)
+            gamma = trial.suggest_float("gamma", 0.5, 2.0)
+            errs = []
+            for tr, te in tscv.split(Xv):
+                scaler, lasso, a = self._fit_arrays(
+                    Xv.iloc[tr], yv.iloc[tr], alpha, gamma)
+                pred = lasso.predict(scaler.transform(Xv.iloc[te]) * a)
+                errs.append(mean_squared_error(yv.iloc[te], pred))
+            return float(np.sqrt(np.mean(errs)))
+
+        study = optuna.create_study(
+            direction="minimize",
+            sampler=optuna.samplers.TPESampler(seed=random_state))
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+        self.alpha = study.best_params["alpha"]
+        self.gamma = study.best_params["gamma"]
+        logger.info("AdaptiveLasso best CV RMSE: %.6f | alpha=%.4g gamma=%.3f",
+                    study.best_value, self.alpha, self.gamma)
+        return {"alpha": self.alpha, "gamma": self.gamma}
+
+    @property
+    def coef_(self) -> np.ndarray:
+        """Effective (standardized) coefficients ``lasso.coef_ * |beta_init|^gamma``."""
+        if self._lasso is None:
+            raise RuntimeError("Model not fitted yet.")
+        return self._lasso.coef_ * self._a
+
+    def selected_features(self, threshold: float = 1e-8) -> list[str]:
+        """Names of features with a non-zero adaptive coefficient."""
+        if self._cols is None:
+            raise RuntimeError("Model not fitted yet.")
+        return [c for c, b in zip(self._cols, self.coef_) if abs(b) > threshold]
+
+    @property
+    def name(self) -> str:
+        return "Adaptive LASSO"
+
+
+def selection_stability_report(
+    model_factory,
+    X: pd.DataFrame,
+    y: pd.Series,
+    n_splits: int = 5,
+    horizon: int = 22,
+) -> pd.DataFrame:
+    """Cross-fold selection frequency & sign stability of a sparse linear model.
+
+    Refits ``model_factory()`` (any model exposing ``coef_`` aligned to
+    ``X.columns``, e.g. :class:`AdaptiveLassoModel` / :class:`ElasticNetModel`)
+    on each purged walk-forward training fold and records which features survive.
+    A feature you can trust is one selected in most folds with a stable sign;
+    coefficients that flip sign across windows are the interpretability trap the
+    literature flags for penalised regression on serially-dependent data.
+
+    Parameters
+    ----------
+    model_factory:
+        Zero-arg callable returning a fresh, unfitted model with a ``coef_``
+        attribute aligned to ``X.columns`` after ``fit``.
+    X, y:
+        Feature matrix and target.
+    n_splits, horizon:
+        Purged-CV fold count and label horizon (for label-overlap purging).
+
+    Returns
+    -------
+    DataFrame indexed by feature with columns ``selection_freq`` (fraction of
+    folds non-zero), ``mean_coef``, ``sign_consistency`` (max share of one sign
+    among the folds where selected), ``n_folds``; sorted by ``selection_freq``.
+    """
+    from src.evaluation import PurgedTimeSeriesSplit
+
+    cols = list(X.columns)
+    splitter = PurgedTimeSeriesSplit(n_splits=n_splits, horizon=horizon)
+    coefs = []
+    for tr, _ in splitter.split(X):
+        m = model_factory()
+        m.fit(X.iloc[tr], y.iloc[tr])
+        coefs.append(np.asarray(m.coef_, dtype=float))
+    C = np.vstack(coefs)                            # (n_folds, p)
+    nz = np.abs(C) > 1e-8
+    with np.errstate(invalid="ignore"):
+        pos = ((C > 0) & nz).sum(axis=0)
+        neg = ((C < 0) & nz).sum(axis=0)
+        tot = np.maximum(pos + neg, 1)
+        sign_consistency = np.maximum(pos, neg) / tot
+    out = pd.DataFrame({
+        "selection_freq": nz.mean(axis=0),
+        "mean_coef": C.mean(axis=0),
+        "sign_consistency": sign_consistency,
+        "n_folds": int(C.shape[0]),
+    }, index=cols)
+    return out.sort_values("selection_freq", ascending=False)
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +792,58 @@ class EnsembleModel(BaseForecaster):
     def name(self) -> str:
         names = "+".join(f.name for f in self.forecasters)
         return f"Ensemble({names})"
+
+
+# ---------------------------------------------------------------------------
+# Trimmed-mean forecast combination (robust 1/N)
+# ---------------------------------------------------------------------------
+
+
+class TrimmedMeanForecaster(BaseForecaster):
+    """Trimmed-mean forecast combination — a robust variant of the 1/N average.
+
+    Averages the base forecasts after dropping the most extreme ``trim`` fraction
+    at each tail per observation.  Combination theory (Bates & Granger 1969) and
+    the "forecast-combination puzzle" (Stock & Watson 2004; Genre et al. 2013)
+    show that the equal-weight average — :class:`EnsembleModel` with default
+    weights — is very hard to beat with *estimated* optimal weights once
+    estimation error is paid for; the trimmed mean just adds robustness to a
+    single rogue member.  Benchmark your stacking ensemble against this and the
+    plain 1/N with :func:`src.evaluation.white_reality_check`.
+
+    Parameters
+    ----------
+    forecasters:
+        Base forecasters to combine.
+    trim:
+        Fraction trimmed from each tail per observation (0.1 -> drop top/bottom
+        10% of the member forecasts before averaging).
+    """
+
+    def __init__(self, forecasters: list[BaseForecaster], trim: float = 0.1) -> None:
+        if not forecasters:
+            raise ValueError("forecasters must be a non-empty list")
+        if not 0.0 <= trim < 0.5:
+            raise ValueError("trim must be in [0, 0.5)")
+        self.forecasters = forecasters
+        self.trim = float(trim)
+
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> "TrimmedMeanForecaster":
+        for f in self.forecasters:
+            f.fit(X, y)
+        return self
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        preds = np.sort(np.column_stack([f.predict(X) for f in self.forecasters]), axis=1)
+        k = preds.shape[1]
+        cut = int(np.floor(self.trim * k))
+        if 2 * cut >= k:
+            return preds.mean(axis=1)
+        return preds[:, cut:k - cut].mean(axis=1)
+
+    @property
+    def name(self) -> str:
+        return f"TrimmedMean({len(self.forecasters)})"
 
 
 # ---------------------------------------------------------------------------
