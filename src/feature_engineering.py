@@ -526,6 +526,7 @@ def split_features_targets(
     drop_nan: bool = True,
     horizon_unit: str = "d",
     target_kind: str = "ret",
+    min_col_coverage: float = 0.0,
 ) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
     """Separate features, target return series, and target price series.
 
@@ -542,6 +543,17 @@ def split_features_targets(
         ``target_ret_{h}{u}``.  ``"retvol"`` returns the vol-normalised target
         ``target_retvol_{h}{u}`` (requires ``build_features(...,
         vol_normalise_targets=True)``).  ``y_price`` is unchanged either way.
+    min_col_coverage:
+        Coverage guard against short-history columns.  The final row mask keeps
+        only rows where *every* feature is non-NaN, so a single series that
+        starts late (e.g. an inventory feed with only a few recent years)
+        collapses the whole matrix to its own short intersection.  When
+        ``> 0``, any feature whose non-NaN coverage over the target-available
+        window is below this fraction is dropped (with a warning) *before* the
+        row mask, so it can't truncate the long-history core.  Default ``0.0``
+        preserves the original behaviour.  Trade-off: a higher value keeps more
+        rows but fewer columns; a lower value keeps more columns but truncates
+        to the shortest survivor.
 
     Returns
     -------
@@ -573,7 +585,25 @@ def split_features_targets(
         # Drop columns that are entirely NaN (e.g. a failed API fetch) so they
         # don't cause every row to be eliminated by the row-wise all() check.
         X = X.dropna(axis=1, how="all")
-        mask = X.notna().all(axis=1) & y_ret.notna() & y_price.notna()
+
+        target_ok = y_ret.notna() & y_price.notna()
+
+        # Coverage guard: drop short-history columns before the row-wise all()
+        # so one late-starting series can't collapse the long-history core.
+        if min_col_coverage > 0.0 and target_ok.any():
+            coverage = X.loc[target_ok].notna().mean()
+            keep = coverage[coverage >= min_col_coverage].index
+            dropped = [c for c in X.columns if c not in keep]
+            if dropped:
+                logger.warning(
+                    "split_features_targets: dropping %d low-coverage column(s) "
+                    "(<%.0f%% over target window): %s",
+                    len(dropped), min_col_coverage * 100.0,
+                    ", ".join(dropped[:10]) + (" …" if len(dropped) > 10 else ""),
+                )
+            X = X[keep]
+
+        mask = X.notna().all(axis=1) & target_ok
         X = X[mask]
         y_ret = y_ret[mask]
         y_price = y_price[mask]
