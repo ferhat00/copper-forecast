@@ -61,7 +61,23 @@
       "WebFetch(domain:www.federalreserve.gov)",
       "Bash(pip install *)",
       "WebFetch(domain:openknowledge.worldbank.org)",
-      "WebFetch(domain:onlinelibrary.wiley.com)"
+      "WebFetch(domain:onlinelibrary.wiley.com)",
+      "PowerShell(Get-Command python, python3, py -ErrorAction SilentlyContinue)",
+      "PowerShell(& python -c \"import sys,importlib.util as u; print\\(sys.executable\\); print\\('pytest', bool\\(u.find_spec\\('pytest'\\)\\)\\); print\\('pandas', bool\\(u.find_spec\\('pandas'\\)\\)\\); print\\('statsmodels', bool\\(u.find_spec\\('statsmodels'\\)\\)\\); print\\('sklearn', bool\\(u.find_spec\\('sklearn'\\)\\)\\)\")",
+      "PowerShell(& python -m pytest tests/test_model_lineup.py -q 2>&1)",
+      "PowerShell(& python -m pytest tests/test_evaluation_stats.py tests/test_wave1_models.py tests/test_wave2_models.py tests/test_new_models.py tests/test_conformal.py tests/test_purged_cv.py -q 2>&1)",
+      "PowerShell(& python -m pytest tests/ -q 2>&1)",
+      "PowerShell(& python \"C:\\\\Users\\\\Ferhat\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-Ferhat-Documents-GitHub-copper-forecast\\\\0619d30b-8398-4abd-bcd0-731e3c12902c\\\\scratchpad\\\\smoke_lineup.py\" 2>&1)",
+      "PowerShell(& python \"C:\\\\Users\\\\Ferhat\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-Ferhat-Documents-GitHub-copper-forecast\\\\0619d30b-8398-4abd-bcd0-731e3c12902c\\\\scratchpad\\\\nb_map.py\" 2>&1)",
+      "PowerShell(& python \"C:\\\\Users\\\\Ferhat\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-Ferhat-Documents-GitHub-copper-forecast\\\\0619d30b-8398-4abd-bcd0-731e3c12902c\\\\scratchpad\\\\nb_dump.py\" 2>&1)",
+      "PowerShell(& python \"C:\\\\Users\\\\Ferhat\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-Ferhat-Documents-GitHub-copper-forecast\\\\0619d30b-8398-4abd-bcd0-731e3c12902c\\\\scratchpad\\\\nb_dump2.py\" 2>&1)",
+      "PowerShell(Copy-Item \"c:\\\\Users\\\\Ferhat\\\\Documents\\\\GitHub\\\\copper-forecast\\\\copper_forecast_kaggle_monthly.ipynb\" \"C:\\\\Users\\\\Ferhat\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-Ferhat-Documents-GitHub-copper-forecast\\\\0619d30b-8398-4abd-bcd0-731e3c12902c\\\\scratchpad\\\\monthly_nb_backup.ipynb\"; \\(Get-Content \"c:\\\\Users\\\\Ferhat\\\\Documents\\\\GitHub\\\\copper-forecast\\\\copper_forecast_kaggle_monthly.ipynb\" | Measure-Object -Line\\).Lines)",
+      "PowerShell(& python \"C:\\\\Users\\\\Ferhat\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-Ferhat-Documents-GitHub-copper-forecast\\\\0619d30b-8398-4abd-bcd0-731e3c12902c\\\\scratchpad\\\\nb_patch.py\" 2>&1)",
+      "PowerShell(& python \"C:\\\\Users\\\\Ferhat\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-Ferhat-Documents-GitHub-copper-forecast\\\\0619d30b-8398-4abd-bcd0-731e3c12902c\\\\scratchpad\\\\nb_probe37.py\" 2>&1)",
+      "PowerShell(& python \"C:\\\\Users\\\\Ferhat\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-Ferhat-Documents-GitHub-copper-forecast\\\\0619d30b-8398-4abd-bcd0-731e3c12902c\\\\scratchpad\\\\nb_validate.py\" 2>&1)",
+      "PowerShell(git -C \"c:\\\\Users\\\\Ferhat\\\\Documents\\\\GitHub\\\\copper-forecast\" status --short)",
+      "PowerShell(git -C \"c:\\\\Users\\\\Ferhat\\\\Documents\\\\GitHub\\\\copper-forecast\" diff --stat -- config_monthly.yaml src/evaluation.py scripts/run_monthly_review.py copper_forecast_kaggle_monthly.ipynb)",
+      "PowerShell($head = git -C \"c:\\\\Users\\\\Ferhat\\\\Documents\\\\GitHub\\\\copper-forecast\" show HEAD:copper_forecast_kaggle_monthly.ipynb; Write-Output \\(\"HEAD lines: \" + \\($head | Measure-Object -Line\\).Lines\\); Write-Output \\(\"HEAD first 120 chars: \" + $head.Substring\\(0, [Math]::Min\\(120, $head.Length\\)\\)\\))"
     ]
   }
 }
