@@ -41,19 +41,13 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
 from src.cointegration import compute_ect, test_cointegration  # noqa: E402
-from src.evaluation import compare_models, subperiod_metrics  # noqa: E402
+from src.evaluation import (  # noqa: E402
+    compare_models, subperiod_metrics, select_best_model,
+)
 from src.feature_engineering import build_features, split_features_targets  # noqa: E402
 from src.data_ingestion import load_data  # noqa: E402
-from src.models import (  # noqa: E402
-    AdaptiveLassoModel,
-    FuturesBasisBenchmark,
-    NaiveModel,
-)
-from src.models_dma import DMAForecaster  # noqa: E402
-from src.models_ecm import ECMForecaster  # noqa: E402
-from src.models_gam import GAMForecaster  # noqa: E402
-from src.models_markov import MarkovSwitchingForecaster  # noqa: E402
-from src.models_midas import MIDASForecaster  # noqa: E402
+from src.model_lineup import build_model_lineup, build_density_layer  # noqa: E402
+from src.altdata import attach_altdata_features  # noqa: E402
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 
@@ -94,6 +88,7 @@ def main() -> None:
     print("Loading monthly data (yfinance + FRED"
           f"{' + AlphaVantage' if USE_ALPHA_VANTAGE else ''}"
           f"{' + EIA' if USE_EIA else ''}; LME basis = synthetic) …")
+    src_cfg = cfg.get("sources", {}) or {}
     df_raw = load_data(
         start=START,
         freq="M",
@@ -102,7 +97,13 @@ def main() -> None:
         eia_api_key=_secret(cfg, "eia", "EIA_API_KEY") if USE_EIA else None,
         include_cot=False,
         include_lme_basis=True,
+        lme_basis_csv=src_cfg.get("lme_basis_csv"),   # real cash/3M feed (D1) if provided
     )
+
+    # Phase-4 alt-data: attach GPR/EPU, news sentiment, and a real LME basis when
+    # the corresponding config flags are on (all off by default => no-op offline).
+    df_raw = attach_altdata_features(
+        df_raw, cfg, start=START, fred_api_key=_secret(cfg, "fred", "FRED_API_KEY"))
 
     # Rolling error-correction terms vs the economic anchors that are present.
     # (Full-sample Engle-Granger is reported for transparency, but the ECM uses
@@ -152,18 +153,10 @@ def main() -> None:
     ect_in_X = [c for c in X.columns if c.startswith("ect_")]
     print(f"ECTs in X: {ect_in_X};  basis in X: {'copper_basis_pct' in X.columns}\n")
 
-    models = [
-        NaiveModel(),
-        FuturesBasisBenchmark(horizon=PRIMARY_HORIZON, tenor_periods=3),
-        AdaptiveLassoModel(alpha=0.01),
-        ECMForecaster(),
-        ECMForecaster(asymmetric=True, mode="mtar"),
-        DMAForecaster(),
-        MIDASForecaster(),                          # Wave 2: restricted distributed lag
-        MarkovSwitchingForecaster(k_regimes=2),     # Wave 2: regime-switching mean
-        GAMForecaster(max_features=6),              # Wave 2: additive splines
-        # GARCH-MIDAS is a variance model -> evaluate via intervals/CRPS, not RMSE.
-    ]
+    # Headline lineup is now config-driven (config_monthly.yaml -> models.enabled),
+    # shared with copper_forecast_kaggle_monthly.ipynb so the two cannot drift.
+    models = build_model_lineup(cfg, PRIMARY_HORIZON, tenor_periods=3)
+    print(f"Headline lineup ({len(models)}): {[m.name for m in models]}")
 
     summary, cv_results = compare_models(
         models, X, y_ret,
@@ -186,6 +179,23 @@ def main() -> None:
     print("\nModel Confidence Set (alpha=0.10):",
           [m for m in summary.index if bool(summary.loc[m, "in_mcs"])]
           if "in_mcs" in summary.columns else "n/a")
+
+    # Robust selection — gate on Clark-West (the *correct* nested test vs the RW),
+    # rank by the selection-bias-corrected deflated Sharpe. Driven by
+    # config_monthly.yaml -> cv.selection so the notebook uses the same rule.
+    sel_cfg = cv_cfg.get("selection") or {}
+    try:
+        sel = select_best_model(
+            summary,
+            criterion=sel_cfg.get("criterion", "deflated_sharpe"),
+            alpha=sel_cfg.get("selection_alpha", 0.10),
+            require_beats_naive=sel_cfg.get("require_beats_naive", True),
+            one_se_rule=sel_cfg.get("one_se_rule", False),
+            gate_test=sel_cfg.get("gate_test", "clark_west"),
+        )
+        print(f"\nSelected model: {sel['best']}\n  reason: {sel['reason']}")
+    except Exception as exc:
+        print(f"\nSelection step unavailable: {exc}")
 
     # Interpretability read-outs from the fitted instances.
     dma = next((m for m in models if m.name == "DMA"), None)
@@ -212,8 +222,37 @@ def main() -> None:
                                periods_per_year=PERIODS_PER_YEAR, by="year")
         print(sp[["rmse_skill", "directional_accuracy", "n"]].round(3).to_string())
 
+    # ── Density / interval layer — scored on coverage + interval score, NOT RMSE.
+    # The mean ties the RW at this horizon; the achievable edge is in the
+    # *distribution* (calibrated intervals) and in *direction* (above).
+    from src.models import AdaptiveLassoModel
+    from src.evaluation import interval_metrics
+    density = build_density_layer(
+        cfg, horizon=PRIMARY_HORIZON,
+        conformal_base=AdaptiveLassoModel(alpha=0.01),
+        conformal_alpha=0.80,
+    )
+    if density:
+        holdout = int(cv_cfg.get("holdout_months", 24))
+        split = len(X) - holdout
+        purge = max(PRIMARY_HORIZON - 1, 0)
+        print(f"\nDensity layer — 80% interval calibration on the last "
+              f"{holdout}m (coverage target 0.80):")
+        for label, dmodel in density.items():
+            try:
+                dmodel.fit(X.iloc[:split - purge], y_ret.iloc[:split - purge])
+                band = dmodel.predict_interval(X.iloc[split:], alpha=0.80)
+                im = interval_metrics(y_ret.iloc[split:].to_numpy(float),
+                                      band["lower"], band["upper"], coverage_level=0.80)
+                print(f"  {label:<14} coverage={im['coverage']:.2f}  "
+                      f"mean_width={im['mean_width']:.4f}  "
+                      f"interval_score={im['interval_score']:.4f}  n={int(im['n_obs'])}")
+            except Exception as exc:
+                print(f"  {label:<14} unavailable: {exc}")
+
     print("\nNote: the Futures-Basis row uses a SYNTHETIC basis (no real LME "
-          "cash-3M feed); supply lme_basis_csv for a genuine carry signal.")
+          "cash-3M feed); set sources.lme_cash_3m_basis + supply a real cash/3M "
+          "feed for a genuine carry signal.")
 
 
 if __name__ == "__main__":

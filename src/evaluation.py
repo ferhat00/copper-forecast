@@ -1338,6 +1338,7 @@ def select_best_model(
     require_beats_naive: bool = True,
     naive_name: Optional[str] = None,
     one_se_rule: bool = False,
+    gate_test: str = "diebold_mariano",
 ) -> dict:
     """Pick a model robustly from a :func:`compare_models` / OOS summary.
 
@@ -1346,10 +1347,14 @@ def select_best_model(
     upward-biased estimator and the single biggest source of optimism on the
     weekly / monthly horizons.  This helper instead:
 
-    1. **Gates on significance** — when ``require_beats_naive`` and a
-       ``dm_pvalue_vs_naive`` column exists, only models that beat the naive
-       random-walk at level ``alpha`` (Diebold-Mariano) are eligible.  If none
-       qualify, it falls back to the naive model and says so in ``reason``.
+    1. **Gates on significance** — when ``require_beats_naive`` and the gate
+       p-value column exists, only models that beat the naive random-walk at
+       level ``alpha`` are eligible.  If none qualify, it falls back to the naive
+       model and says so in ``reason``.  ``gate_test`` selects the test:
+       ``"clark_west"`` (the *correct* test when the candidate nests the RW —
+       every regression does — uses ``cw_pvalue_vs_naive``) or
+       ``"diebold_mariano"`` (``dm_pvalue_vs_naive``; biased/invalid for nested
+       models, kept as the backward-compatible default).
     2. **Ranks by a selection-aware criterion** — defaults to ``deflated_sharpe``
        (selection-bias corrected) rather than the raw Sharpe.
     3. **Optional one-standard-error rule** — among eligible models, prefer the
@@ -1374,6 +1379,12 @@ def select_best_model(
         None, a row whose name contains "naive" is auto-detected.
     one_se_rule:
         Apply the one-standard-error tie-break (needs ``signal_sharpe_fold_std``).
+    gate_test:
+        Which nested-vs-naive test gates eligibility: ``"clark_west"`` (correct
+        for RW-nested models) or ``"diebold_mariano"`` (default, backward
+        compatible).  Resolves to the ``cw_pvalue_vs_naive`` /
+        ``dm_pvalue_vs_naive`` column; if that column is absent the gate is
+        skipped (all models eligible).
 
     Returns
     -------
@@ -1399,8 +1410,13 @@ def select_best_model(
     fell_back = False
     reason_bits = [f"ranked by {criterion} ({'higher' if higher else 'lower'}=better)"]
 
-    if require_beats_naive and "dm_pvalue_vs_naive" in summary.columns:
-        sig = ranking[ranking["dm_pvalue_vs_naive"] < alpha]
+    _gate_cols = {"clark_west": "cw_pvalue_vs_naive",
+                  "diebold_mariano": "dm_pvalue_vs_naive"}
+    gate_col = _gate_cols.get(gate_test, "dm_pvalue_vs_naive")
+    gate_label = "CW" if gate_col == "cw_pvalue_vs_naive" else "DM"
+
+    if require_beats_naive and gate_col in summary.columns:
+        sig = ranking[ranking[gate_col] < alpha]
         # The naive model trivially ties itself — never count it as "beating".
         if naive_name is not None:
             sig = sig.drop(index=naive_name, errors="ignore")
@@ -1408,7 +1424,7 @@ def select_best_model(
             fell_back = True
             best = naive_name if naive_name is not None else ranking.index[0]
             reason_bits.append(
-                f"no model beats naive at alpha={alpha} (DM) -> fall back to "
+                f"no model beats naive at alpha={alpha} ({gate_label}) -> fall back to "
                 f"{'naive' if naive_name else 'best-by-criterion'}")
             return {
                 "best": best, "criterion": criterion,
@@ -1416,7 +1432,8 @@ def select_best_model(
                 "fell_back": fell_back, "reason": "; ".join(reason_bits),
             }
         eligible = sig
-        reason_bits.append(f"{len(sig)} model(s) beat naive at alpha={alpha}")
+        reason_bits.append(
+            f"{len(sig)} model(s) beat naive at alpha={alpha} ({gate_label})")
 
     best = eligible.index[0]
 
@@ -1458,6 +1475,7 @@ def nested_cv_select(
     criterion: str = "deflated_sharpe",
     alpha: float = 0.10,
     require_beats_naive: bool = True,
+    gate_test: str = "diebold_mariano",
 ) -> dict:
     """Nested CV: pick a model on inner folds, score it on the outer-test fold.
 
@@ -1531,7 +1549,8 @@ def nested_cv_select(
             continue
 
         sel = select_best_model(inner_summary, criterion=criterion, alpha=alpha,
-                                require_beats_naive=require_beats_naive)
+                                require_beats_naive=require_beats_naive,
+                                gate_test=gate_test)
         chosen = sel["best"]
         chosen_per_fold.append(chosen)
 
